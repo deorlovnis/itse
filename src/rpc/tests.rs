@@ -292,6 +292,21 @@ fn eof_fails_pending_requests_and_later_ones() {
 }
 
 #[test]
+fn a_reply_that_came_just_before_the_close_is_taken_not_dropped() {
+    let (peer, mut srv) = pair(Framing::Headers, Dialect::Lsp, Arc::default());
+    let a = spawn_request(&peer, "a", LONG, Cancel::default());
+    let id = srv.recv()["id"].as_i64().unwrap();
+    // Held across the end of a 100 ms step, the caller waits on the state there. Meanwhile the
+    // reply and then the close come, in the reader's order, as from a server that answers and exits.
+    let mut state = lock(&peer.state);
+    thread::sleep(Duration::from_millis(250));
+    state.0.remove(&id).unwrap().send(Ok(json!("answered"))).unwrap();
+    state.1 = Some("eof".into());
+    drop(state);
+    assert_eq!(a.join().unwrap().unwrap(), "answered");
+}
+
+#[test]
 fn a_panicking_handler_marks_the_peer_crashed() {
     let rec = Arc::new(Rec { panics: true, ..Rec::default() });
     let (peer, mut srv) = pair(Framing::Lines, Dialect::Lsp, rec.clone());
@@ -332,4 +347,16 @@ fn dap_cancels_only_when_the_adapter_supports_it() {
     assert!(matches!(a.join().unwrap(), Err(RpcError::Timeout)));
     let cancel = srv.recv();
     assert_eq!((cancel["command"].as_str(), &cancel["arguments"]), (Some("cancel"), &json!({"requestId": seq})));
+}
+
+#[test]
+fn a_peer_that_stops_reading_blocks_no_caller() {
+    let (peer, srv) = pair(Framing::Headers, Dialect::Lsp, Arc::default());
+    // Far more than the socket buffer holds, and nobody reads it.
+    peer.notify("textDocument/didChange", json!({"text": "x".repeat(8 << 20)})).unwrap();
+    let started = Instant::now();
+    assert!(matches!(peer.request("workspace/symbol", json!({}), Duration::from_millis(200), &Cancel::default()), Err(RpcError::Timeout)));
+    assert!(peer.bye(Duration::from_millis(200)));
+    assert!(started.elapsed() < Duration::from_secs(2), "{:?}", started.elapsed());
+    drop(srv);
 }

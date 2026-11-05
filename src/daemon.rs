@@ -73,15 +73,17 @@ pub fn run(ws: Workspace, dirs: Dirs) -> Result<()> {
     eprintln!("{} itse daemon {VERSION} pid {pid} serves {root}", sys::utc(host.started));
     while !host.stopping.load(Ordering::SeqCst) {
         thread::sleep(Duration::from_millis(250));
+        host.reap();
         if sys::signalled() || host.idle() || !host.ws.root.is_dir() {
             stop(&host);
         } else if fs::symlink_metadata(&host.socket).ok().map(|m| m.ino()) != Some(*lock(&host.bound)) {
             bind(&host).unwrap_or_else(|e| eprintln!("itse daemon: re-binding the socket: {e:#}"));
         }
     }
-    // The listener is closed and the socket gone. Hosted servers will stop here, for up to 3 s, which a
-    // debug-only seam stands in for now; runs are detached and go on, re-adopted by the next daemon
-    // from procs.json. Exiting drops the lock.
+    // The listener is closed and the socket gone. Hosted servers stop here, all at once, and a
+    // debug-only seam can make the stop take longer; runs are detached and go on, re-adopted by the
+    // next daemon from procs.json. Exiting drops the lock.
+    host.stop_servers(Duration::from_secs(5));
     thread::sleep(Duration::from_millis(env::var("ITSE_TEST_STOP_MS").ok().filter(|_| cfg!(debug_assertions)).and_then(|ms| ms.parse().ok()).unwrap_or(0)));
     let _ = fs::remove_file(state.join("daemon.json"));
     eprintln!("{} itse daemon pid {pid} stopped", sys::utc(SystemTime::now()));

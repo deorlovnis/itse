@@ -7,9 +7,6 @@
 //! attached. Consent alone refuses a caller without one: accepting a vendor's licence or a
 //! data-sharing choice is a legal act, which an agent must not do through a shell.
 
-// Pin fields that the store and `lock --refresh` read arrive with them.
-#![allow(dead_code)]
-
 use std::collections::BTreeMap;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};

@@ -103,7 +103,7 @@ fn a_tool_failure_is_isError_not_an_rpc_error() {
     let tmp = TempDir::new("itse-mcp");
     let mut s = Session::new(&host(&tmp, None), &[]);
     s.init("2025-11-25");
-    assert_eq!(s.call("problems_symbols", json!({"verb": "find", "target": "Order"})), (true, "ERROR find — not built yet\n".into()));
+    assert_eq!(s.call("problems_symbols", json!({"verb": "info", "target": "S99"})), (true, "ERROR info — no stored result holds S99\n".into()));
     assert_eq!(s.call("problems_symbols", json!({"verb": "status", "args": [14]})), (true, "ERROR status — args must be strings\n".into()));
     assert_eq!(s.call("problems_symbols", json!({"verb": "status", "args": ["--frobnicate"]})), (true, "ERROR status — invalid option '--frobnicate'\n".into()));
     assert_eq!(s.call("frobnicate", json!({})), (true, "ERROR frobnicate — no such tool\n".into()));

@@ -4,11 +4,10 @@
 //!
 //! One reader thread per peer. Responses go to the request waiting for them; requests from the
 //! other side are answered at once by the `Handler`, so a server that asks something while we wait
-//! on it can't deadlock us. Frames are capped at 4 MiB: a bigger one is read and thrown away, so the
+//! on it can't deadlock us. Writes go through a writer thread of their own, so a peer that stops
+//! reading never blocks a caller (whose timeout then still holds), a goodbye, or the reader thread's
+//! own answers. Frames are capped at 4 MiB: a bigger one is read and thrown away, so the
 //! stream stays in sync and the peer stays usable.
-
-// The daemon socket uses the framing now; `Peer` is for the LSP, DAP and MCP clients, not built yet.
-#![allow(dead_code)]
 
 use std::collections::HashMap;
 use std::io::{self, BufRead, ErrorKind, Read, Write};
@@ -35,6 +34,7 @@ pub enum Framing {
 
 /// How ids are matched, requests cancelled and errors shaped.
 #[derive(Clone, Copy, Debug, PartialEq)]
+#[allow(dead_code)] // the hosted MCP and DAP clients start the other two
 pub enum Dialect {
     Lsp,
     Mcp,
@@ -112,6 +112,7 @@ pub trait Handler: Send + Sync {
 }
 
 #[derive(Debug)]
+#[allow(dead_code)] // `data` is for DAP's failed responses
 pub enum RpcError {
     Timeout,
     Cancelled,
@@ -152,7 +153,8 @@ type Pending = (HashMap<i64, mpsc::Sender<Result<Value, RpcError>>>, Option<Stri
 
 /// One JSON-RPC (or DAP) connection, with its reader thread.
 pub struct Peer {
-    writer: Mutex<Box<dyn Write + Send>>,
+    /// To the writer thread, which writes the frames in order and ends at the first failed write.
+    writer: mpsc::Sender<Value>,
     framing: Framing,
     dialect: Dialect,
     next: AtomicI64,
@@ -163,8 +165,10 @@ pub struct Peer {
 }
 
 impl Peer {
-    pub fn start(r: impl BufRead + Send + 'static, w: impl Write + Send + 'static, f: Framing, d: Dialect, h: Arc<dyn Handler>) -> Arc<Peer> {
-        let peer = Arc::new(Peer { writer: Mutex::new(Box::new(w)), framing: f, dialect: d, next: AtomicI64::new(1), state: Mutex::default(), dap_cancel: AtomicBool::new(false) });
+    pub fn start(r: impl BufRead + Send + 'static, mut w: impl Write + Send + 'static, f: Framing, d: Dialect, h: Arc<dyn Handler>) -> Arc<Peer> {
+        let (writer, frames) = mpsc::channel();
+        let peer = Arc::new(Peer { writer, framing: f, dialect: d, next: AtomicI64::new(1), state: Mutex::default(), dap_cancel: AtomicBool::new(false) });
+        thread::spawn(move || frames.into_iter().try_for_each(|v: Value| write(&mut w, f, &v)));
         let reader = peer.clone();
         thread::spawn(move || reader.read_loop(r, &*h));
         peer
@@ -175,12 +179,16 @@ impl Peer {
     pub fn request(&self, method: &str, params: Value, timeout: Duration, cancel: &Cancel) -> Result<Value, RpcError> {
         let (id, (tx, rx)) = (self.next.fetch_add(1, Ordering::SeqCst), mpsc::channel());
         lock(&self.state).0.insert(id, tx);
-        let (sent, end) = (self.send(&self.message(Some(id), method, params)), Instant::now() + timeout);
+        let (sent, end) = (self.send(self.message(Some(id), method, params)), Instant::now() + timeout);
         let err = loop {
             match (sent.as_ref(), rx.recv_timeout(end.saturating_duration_since(Instant::now()).min(Duration::from_millis(100)))) {
                 (_, Ok(reply)) => return reply,
-                // Closed before this request was entered: nobody will answer it.
-                _ if lock(&self.state).1.is_some() => break RpcError::Closed(lock(&self.state).1.clone().unwrap_or_default()),
+                // Closed before this request was entered: nobody will answer it. The reader delivers a
+                // reply before it records the close, so one that came as this step ran out is taken.
+                _ if lock(&self.state).1.is_some() => match rx.try_recv() {
+                    Ok(reply) => return reply,
+                    Err(_) => break RpcError::Closed(lock(&self.state).1.clone().unwrap_or_default()),
+                },
                 // A request that can't be written fails as closed, as the reader's EOF follows.
                 (Err(e), _) => break RpcError::Closed(format!("write failed: {e}")),
                 _ if cancel.is_cancelled() => break RpcError::Cancelled,
@@ -200,7 +208,22 @@ impl Peer {
     }
 
     pub fn notify(&self, method: &str, params: Value) -> io::Result<()> {
-        self.send(&self.message(None, method, params))
+        self.send(self.message(None, method, params))
+    }
+
+    /// Why the reader ended, once it has.
+    pub fn closed(&self) -> Option<String> {
+        lock(&self.state).1.clone()
+    }
+
+    /// The dialect's goodbye before the process is stopped: LSP `shutdown` (waiting up to `wait`)
+    /// and `exit`. False when the dialect has none, so nobody waits for an exit.
+    pub fn bye(&self, wait: Duration) -> bool {
+        if self.dialect != Dialect::Lsp || self.closed().is_some() {
+            return false;
+        }
+        let _ = self.request("shutdown", Value::Null, wait, &Cancel::default());
+        self.notify("exit", Value::Null).is_ok()
     }
 
     /// A request, or without an id a notification. DAP has no notifications: there it is a request
@@ -213,8 +236,9 @@ impl Peer {
         }
     }
 
-    fn send(&self, v: &Value) -> io::Result<()> {
-        write(&mut *lock(&self.writer), self.framing, v)
+    /// Queued for the writer thread; an error once that has ended at a failed write.
+    fn send(&self, v: Value) -> io::Result<()> {
+        self.writer.send(v).map_err(|_| io::Error::new(ErrorKind::BrokenPipe, "the other side stopped reading"))
     }
 
     /// Every request in flight when the reader ends, and every later one, fails as closed. A panic
@@ -222,8 +246,9 @@ impl Peer {
     fn read_loop(&self, mut r: impl BufRead, h: &dyn Handler) {
         let why = panic::catch_unwind(AssertUnwindSafe(|| self.serve(&mut r, h))).unwrap_or_else(|_| "crashed: handler panic".into());
         let pending = mem::replace(&mut *lock(&self.state), (HashMap::new(), Some(why.clone()))).0;
-        pending.into_values().for_each(|tx| _ = tx.send(Err(RpcError::Closed(why.clone()))));
+        // The handler hears first, so a caller woken by its failed request finds the close recorded.
         h.closed(&why);
+        pending.into_values().for_each(|tx| _ = tx.send(Err(RpcError::Closed(why.clone()))));
     }
 
     /// Read and dispatch until EOF or a read error; returns why it ended.
@@ -257,7 +282,7 @@ impl Peer {
                 id.as_i64().and_then(|id| lock(&self.state).0.remove(&id)).map(|tx| tx.send(if e.is_null() { Ok(msg["result"].take()) } else { Err(remote()) }));
             }
             (id, Some(method)) => {
-                let _ = self.send(&match (self.dialect, h.request(&method, msg["params"].take())) {
+                let _ = self.send(match (self.dialect, h.request(&method, msg["params"].take())) {
                     (Dialect::Dap, reply) => json!({"seq": self.next.fetch_add(1, Ordering::SeqCst), "type": "response", "request_seq": id, "command": method,
                         "success": reply.is_ok(), "body": reply.as_ref().ok(), "message": reply.as_ref().err().map(|e| &e.1)}),
                     (_, Ok(result)) => json!({"jsonrpc": "2.0", "id": id, "result": result}),

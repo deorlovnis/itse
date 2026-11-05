@@ -28,12 +28,14 @@ use crate::workspace::{Dirs, Workspace};
 pub struct Resolved {
     pub manifest: Manifest,
     pub states: Vec<State>,
-    /// What the session host may start; not used yet, the resolver tests read it now.
-    #[allow(dead_code)]
+    /// What the session host may start.
     pub launches: Vec<Launch>,
     pub notes: Vec<String>,
     pub trust_hash: String,
     pub trusted: bool,
+    /// The servers left out of `launches` until trust: those that (or whose packages) run project
+    /// code, and every one from the team layer.
+    pub held: Vec<String>,
     /// Each present package's root: its store dir, or the folder a `path` install was found in.
     pub roots: BTreeMap<String, PathBuf>,
 }
@@ -137,14 +139,19 @@ pub fn resolve_for(ws: &Workspace, dirs: &Dirs, env: &BTreeMap<String, String>, 
     for (id, file) in m.detected(&ws.root, &uses) {
         states.push(row(&id, "suggested", format!("{file} found"), Some("agent"), &["use", &id]));
     }
-    let launches = launches(&cx, &m, &uses, &roots, &ok, &code, trusted);
+    let mut held = Vec::new();
+    for u in uses.iter().filter(|_| !trusted) {
+        let servers = m.exts.get(&u.id).into_iter().flat_map(|e| &e.0.servers);
+        held.extend(servers.filter(|s| u.team || code.iter().any(|c| c.0 == s.id)).map(|s| s.id.clone()));
+    }
+    let launches = launches(&cx, &m, &uses, &roots, &ok, &held, trusted);
     let mut notes = m.notes.clone();
     notes.push(match &m.dev {
         Some((path, _)) => format!("layer: {} for repo {}", path.display(), ws.repo_name().display()),
         None => "layer: none; 'itse use <ext>' declares one".into(),
     });
     notes.extend(m.team.iter().map(|_| "team layer: .itse/itse.json, read-only".to_string()));
-    Ok(Resolved { manifest: m, states, launches, notes, trust_hash, trusted, roots })
+    Ok(Resolved { manifest: m, states, launches, notes, trust_hash, trusted, held, roots })
 }
 
 /// One package's row, and its root when it is present.
@@ -187,14 +194,15 @@ fn package(cx: &Cx, ext: &str, name: &str, pkg: &Package, install: &str) -> Resu
 
 /// A `Launch` for each server of the extensions in use whose packages are present and usable,
 /// leaving out what runs project code (and everything from the team layer) until trust. Templates
-/// in `init_options` and `settings` are rendered like the command's.
-fn launches(cx: &Cx, m: &Manifest, uses: &[Use], roots: &BTreeMap<String, PathBuf>, ok: &BTreeSet<String>, code: &[(String, Value)], trusted: bool) -> Vec<Launch> {
+/// in `init_options` and `settings` are rendered like the command's; a server without
+/// `init_options` is initialized with its settings under its own id.
+fn launches(cx: &Cx, m: &Manifest, uses: &[Use], roots: &BTreeMap<String, PathBuf>, ok: &BTreeSet<String>, held: &[String], trusted: bool) -> Vec<Launch> {
     let (ws, dirs, consents) = (cx.ws, cx.dirs, &cx.consents);
     let settings = m.merged(|l| &l.servers);
     let mut out = Vec::new();
     for u in uses {
         for s in m.exts.get(&u.id).into_iter().flat_map(|e| &e.0.servers) {
-            if !trusted && (u.team || code.iter().any(|c| c.0 == s.id)) {
+            if held.contains(&s.id) {
                 continue;
             }
             let mut fill = |key: &str| match key.split_once(':') {
@@ -205,6 +213,7 @@ fn launches(cx: &Cx, m: &Manifest, uses: &[Use], roots: &BTreeMap<String, PathBu
                 }),
                 _ if key == "cache" => Some(dirs.cache.display().to_string()),
                 _ if key == "workspaceFolder" => Some(ws.root.display().to_string()),
+                _ if key == "ws" => Some(ws.ws.clone()),
                 _ => None,
             };
             let argv: Result<Vec<String>> = s.command.iter().map(|t| render(t, &mut fill)).collect();
@@ -214,6 +223,8 @@ fn launches(cx: &Cx, m: &Manifest, uses: &[Use], roots: &BTreeMap<String, PathBu
             let set = settings.get(&s.id).filter(|x| trusted || !x.1).map(|x| x.0);
             let lsp_settings = set.and_then(|x| x.settings.as_ref()).unwrap_or(&s.settings);
             let (Ok(settings), Ok(init_options)) = (render_value(lsp_settings, &mut fill), render_value(&s.init_options, &mut fill)) else { continue };
+            // Without init_options a server gets its own section of the settings, so a manifest says them once.
+            let init_options = if s.init_options.is_null() { settings.get(&s.id).cloned().unwrap_or_default() } else { init_options };
             let exit_codes = m.packages_of(s, uses).flat_map(|p| &p.exit_codes).filter_map(|(k, v)| Some((k.parse().ok()?, v.clone()))).collect();
             out.push(Launch {
                 id: s.id.clone(),
@@ -226,6 +237,8 @@ fn launches(cx: &Cx, m: &Manifest, uses: &[Use], roots: &BTreeMap<String, PathBu
                 settings,
                 init_options,
                 languages: s.languages.clone(),
+                filetypes: s.filetypes.clone(),
+                outputs: s.outputs.clone(),
                 idle_minutes: set.and_then(|x| x.idle_minutes).or(s.idle_minutes),
                 timeout_s: s.timeout_s,
                 expose: set.is_some_and(|x| x.expose),

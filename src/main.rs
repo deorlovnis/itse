@@ -14,6 +14,7 @@ mod dap;
 mod env;
 mod host;
 mod lock;
+mod lsp;
 mod manifest;
 mod mcp;
 mod parse;
