@@ -1,0 +1,90 @@
+{
+  "url": "https://api.github.com/repos/rust-lang/rust-analyzer/releases/431149117",
+  "html_url": "https://github.com/rust-lang/rust-analyzer/releases/tag/2026-11-02",
+  "id": 431149117,
+  "tag_name": "2026-11-02",
+  "name": "2026-11-02",
+  "draft": false,
+  "prerelease": false,
+  "created_at": "2026-11-01T17:52:04Z",
+  "published_at": "2026-11-02T06:53:51Z",
+  "assets": [
+    {
+      "name": "rust-analyzer-aarch64-apple-darwin.gz",
+      "size": 14307639,
+      "digest": "sha256:d10ca0a10e386f74ca36847b3df2ad5ab6f1328feeb1591467b3724f3fd8e8cf",
+      "content_type": "application/octet-stream",
+      "browser_download_url": "https://github.com/rust-lang/rust-analyzer/releases/download/2026-11-02/rust-analyzer-aarch64-apple-darwin.gz"
+    },
+    {
+      "name": "rust-analyzer-aarch64-unknown-linux-gnu.gz",
+      "size": 14723671,
+      "digest": "sha256:4f8699eaee4231df5a5ffd477106ecae3bf6328918a60de742798912ecff6869",
+      "content_type": "application/octet-stream",
+      "browser_download_url": "https://github.com/rust-lang/rust-analyzer/releases/download/2026-11-02/rust-analyzer-aarch64-unknown-linux-gnu.gz"
+    },
+    {
+      "name": "rust-analyzer-arm-unknown-linux-gnueabihf.gz",
+      "size": 15633341,
+      "digest": "sha256:ab039dd822b0ef17e63c4f7d321e211b16d8541bd89d2ae7cabfb9c2f1266e06",
+      "content_type": "application/octet-stream",
+      "browser_download_url": "https://github.com/rust-lang/rust-analyzer/releases/download/2026-11-02/rust-analyzer-arm-unknown-linux-gnueabihf.gz"
+    },
+    {
+      "name": "rust-analyzer-darwin-arm64.vsix",
+      "size": 15774754,
+      "digest": "sha256:1e95130ab14a96f69f00822696bcae822590f89da3ccb3f8ba8accdba6e40f63",
+      "content_type": "application/octet-stream",
+      "browser_download_url": "https://github.com/rust-lang/rust-analyzer/releases/download/2026-11-02/rust-analyzer-darwin-arm64.vsix"
+    },
+    {
+      "name": "rust-analyzer-darwin-x64.vsix",
+      "size": 16266488,
+      "digest": "sha256:4c6743b631c6aa019d56e63e876809d638e95e9d442c882fa24d22c9674ce921",
+      "content_type": "application/octet-stream",
+      "browser_download_url": "https://github.com/rust-lang/rust-analyzer/releases/download/2026-11-02/rust-analyzer-darwin-x64.vsix"
+    },
+    {
+      "name": "rust-analyzer-linux-arm64.vsix",
+      "size": 16212923,
+      "digest": "sha256:896a22b81d98bf54f52776ba526a648350ab3b6c4534fb82110d7b57ae9c0a9c",
+      "content_type": "application/octet-stream",
+      "browser_download_url": "https://github.com/rust-lang/rust-analyzer/releases/download/2026-11-02/rust-analyzer-linux-arm64.vsix"
+    },
+    {
+      "name": "rust-analyzer-linux-armhf.vsix",
+      "size": 17023722,
+      "digest": "sha256:dab256a53789786b0f17125f56e9774f60fbe858faa35e6fd4f2565785fbd425",
+      "content_type": "application/octet-stream",
+      "browser_download_url": "https://github.com/rust-lang/rust-analyzer/releases/download/2026-11-02/rust-analyzer-linux-armhf.vsix"
+    },
+    {
+      "name": "rust-analyzer-linux-x64.vsix",
+      "size": 16574374,
+      "digest": "sha256:a392ccf68a04a341d721f8bbddbae826cf2173127065ba76c458c55acc3b45a2",
+      "content_type": "application/octet-stream",
+      "browser_download_url": "https://github.com/rust-lang/rust-analyzer/releases/download/2026-11-02/rust-analyzer-linux-x64.vsix"
+    },
+    {
+      "name": "rust-analyzer-x86_64-apple-darwin.gz",
+      "size": 15052626,
+      "digest": "sha256:2c3d6c564f9b2734085cf6439c78896545e86b54ebb63870ba701e12ca582b22",
+      "content_type": "application/octet-stream",
+      "browser_download_url": "https://github.com/rust-lang/rust-analyzer/releases/download/2026-11-02/rust-analyzer-x86_64-apple-darwin.gz"
+    },
+    {
+      "name": "rust-analyzer-x86_64-unknown-linux-gnu.gz",
+      "size": 15296882,
+      "digest": "sha256:5249da68c3f36bb77ea7d401824f5e8bd8d0a47a162daf5f72208eb7c1bf1500",
+      "content_type": "application/octet-stream",
+      "browser_download_url": "https://github.com/rust-lang/rust-analyzer/releases/download/2026-11-02/rust-analyzer-x86_64-unknown-linux-gnu.gz"
+    },
+    {
+      "name": "rust-analyzer-x86_64-unknown-linux-musl.gz",
+      "size": 15468883,
+      "digest": "sha256:8ad63db9663672836f86526d2a6e6d92d1594edb954bf6dfc5dab5c56273ad4d",
+      "content_type": "application/octet-stream",
+      "browser_download_url": "https://github.com/rust-lang/rust-analyzer/releases/download/2026-11-02/rust-analyzer-x86_64-unknown-linux-musl.gz"
+    }
+  ]
+}

@@ -1,0 +1,32 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.01s
+     Running unittests src/lib.rs (target/debug/deps/spawn-c204b045c9ca74d1)
+
+running 1 test
+test tests::worker_result_is_used ... FAILED
+
+failures:
+
+---- tests::worker_result_is_used stdout ----
+
+thread '<unnamed>' (96862) panicked at src/lib.rs:2:36:
+worker gave up
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+thread 'tests::worker_result_is_used' (96861) panicked at src/lib.rs:2:71:
+called `Result::unwrap()` on an `Err` value: Any { .. }
+
+
+failures:
+    tests::worker_result_is_used
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `--lib`
+   Doc-tests spawn
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+error: 1 target failed:
+    `--lib`

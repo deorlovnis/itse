@@ -1,0 +1,175 @@
+{
+  "itse_ext": 1,
+  "id": "rust",
+  "version": "0.1.0",
+  "detect": [
+    "Cargo.toml"
+  ],
+  "packages": {
+    "rust-analyzer": {
+      "purl": "pkg:github/rust-lang/rust-analyzer",
+      "install": "path",
+      "pin_source": {
+        "kind": "github-release",
+        "repo": "rust-lang/rust-analyzer",
+        "assets": {
+          "linux_arm64": "rust-analyzer-aarch64-unknown-linux-gnu.gz",
+          "linux_x64": "rust-analyzer-x86_64-unknown-linux-gnu.gz"
+        }
+      },
+      "archive": "gz",
+      "bin": {
+        "rust-analyzer": "rust-analyzer"
+      },
+      "hosts": [
+        "api.github.com",
+        "github.com",
+        "release-assets.githubusercontent.com"
+      ],
+      "executes_project_code": true
+    },
+    "cargo": {
+      "purl": "pkg:generic/rust-lang/cargo",
+      "install": "path",
+      "bin": {
+        "cargo": "cargo"
+      }
+    }
+  },
+  "servers": [
+    {
+      "id": "rust-analyzer",
+      "protocol": "lsp",
+      "transport": "stdio",
+      "command": [
+        "${pkg:rust-analyzer}/rust-analyzer"
+      ],
+      "filetypes": [
+        "rs"
+      ],
+      "languages": {
+        "rs": "rust"
+      },
+      "init_options": {
+        "checkOnSave": true,
+        "cargo": {
+          "buildScripts": {
+            "enable": true
+          }
+        },
+        "procMacro": {
+          "enable": true
+        }
+      },
+      "executes_project_code": true
+    }
+  ],
+  "actions": [
+    {
+      "label": "cargo:build",
+      "group": {
+        "kind": "build",
+        "isDefault": true
+      },
+      "args": [
+        "build",
+        "--all-targets",
+        "--message-format=short",
+        "${target_args}"
+      ],
+      "problemMatcher": [
+        "$rustc-short"
+      ],
+      "type": "process",
+      "command": "${pkg:cargo}/cargo",
+      "target_args": [
+        "-p",
+        "${input:target}"
+      ],
+      "outputs": [
+        "target/",
+        "Cargo.lock"
+      ],
+      "executes_project_code": true
+    },
+    {
+      "label": "cargo:test",
+      "group": {
+        "kind": "test",
+        "isDefault": true
+      },
+      "args": [
+        "test",
+        "--tests",
+        "--no-fail-fast",
+        "--message-format=short",
+        "${target_args}",
+        "${filter_args}"
+      ],
+      "filter_args": [
+        "${input:filter}"
+      ],
+      "problemMatcher": [
+        "$rustc-short",
+        "$libtest-panic"
+      ],
+      "counts": {
+        "regexp": "^test result: (?:ok|FAILED)\\. (\\d+) passed; (\\d+) failed; (\\d+) ignored",
+        "passed": 1,
+        "failed": 2,
+        "skipped": 3
+      },
+      "drop_lines": [
+        "^note: run with .RUST_BACKTRACE"
+      ],
+      "notes": [
+        "doctests not run (I2)"
+      ],
+      "type": "process",
+      "command": "${pkg:cargo}/cargo",
+      "target_args": [
+        "-p",
+        "${input:target}"
+      ],
+      "outputs": [
+        "target/",
+        "Cargo.lock"
+      ],
+      "executes_project_code": true
+    }
+  ],
+  "problemMatchers": {
+    "rustc-short": {
+      "owner": "rustc",
+      "fileLocation": "relative",
+      "pattern": {
+        "regexp": "^([^\\s:][^:]*):(\\d+):(\\d+): (error|warning)(?:\\[(\\w+)\\])?: (.*)$",
+        "file": 1,
+        "line": 2,
+        "column": 3,
+        "severity": 4,
+        "code": 5,
+        "message": 6
+      }
+    },
+    "libtest-panic": {
+      "owner": "libtest",
+      "kind": "test",
+      "fileLocation": "relative",
+      "detail_lines": 3,
+      "pattern": [
+        {
+          "regexp": "^thread '([^'<][^']*)'(?: \\(\\d+\\))? panicked at ([^:]+):(\\d+):(\\d+):$",
+          "name": 1,
+          "file": 2,
+          "line": 3,
+          "column": 4
+        },
+        {
+          "regexp": "^(.*)$",
+          "message": 1
+        }
+      ]
+    }
+  }
+}

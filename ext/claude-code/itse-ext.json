@@ -1,0 +1,37 @@
+{
+  "itse_ext": 1,
+  "id": "claude-code",
+  "version": "0.1.0",
+  "identity": {
+    "session_env": "CLAUDE_CODE_SESSION_ID",
+    "client_env": "AI_AGENT",
+    "client_regexp": "^(claude-code)_(\\d+)-(\\d+)-(\\d+)_",
+    "hook_session_from": "/session_id"
+  },
+  "integration": {
+    "skill": { "path": "~/.claude/skills/itse/SKILL.md", "name": "itse", "description": "Workspace facts from itse: tests, problems, symbols by name, debug snapshots" },
+    "mcp": {
+      "add": ["claude", "mcp", "add-json", "itse", "${json}", "--scope", "local"],
+      "remove": ["claude", "mcp", "remove", "itse", "--scope", "local"],
+      "cwd": "${workspaceFolder}",
+      "value": { "type": "stdio", "command": "itse", "args": ["mcp"] }
+    },
+    "recipes": {
+      "post-edit": {
+        "file": "~/.claude/settings.json",
+        "pointer": "/hooks/PostToolUse",
+        "append": { "matcher": "Edit|Write|MultiEdit", "hooks": [{ "type": "command", "command": "itse hook post-edit", "timeout": 10 }] }
+      }
+    }
+  },
+  "hooks": {
+    "post-edit": {
+      "path_from": "/tool_input/file_path",
+      "cwd_from": "/cwd",
+      "verb": "problems",
+      "flags": { "new": true },
+      "wrap": { "hookSpecificOutput": { "hookEventName": "PostToolUse", "additionalContext": "${text}" } },
+      "quiet_when": "empty"
+    }
+  }
+}

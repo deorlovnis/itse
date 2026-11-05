@@ -1,0 +1,21 @@
+{
+  "itse_ext": 1,
+  "id": "bun",
+  "version": "0.1.0",
+  "detect": [".bun-version", "bun.lock"],
+  "packages": {
+    "bun": {
+      "purl": "pkg:github/oven-sh/bun",
+      "install": "fetch",
+      "pin_source": { "kind": "github-release", "repo": "oven-sh/bun", "assets": { "linux_arm64": "bun-linux-aarch64.zip", "linux_x64": "bun-linux-x64.zip" } },
+      "archive": "zip",
+      "strip": 1,
+      "bin": { "bun": "bun" },
+      "hosts": ["api.github.com", "github.com", "release-assets.githubusercontent.com"]
+    }
+  },
+  "project_pins": [
+    { "name": "bun-version", "file": ".bun-version" },
+    { "name": "package.json", "file": "package.json", "keys": ["/packageManager"] }
+  ]
+}

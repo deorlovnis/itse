@@ -1,0 +1,18 @@
+{
+  "itse_ext": 1,
+  "id": "node",
+  "version": "0.1.0",
+  "detect": ["package.json"],
+  "packages": {
+    "node": {
+      "purl": "pkg:generic/nodejs/node",
+      "install": "path",
+      "bin": { "node": "node", "npm": "npm" }
+    }
+  },
+  "project_pins": [
+    { "name": "package.json", "file": "package.json", "keys": ["/engines/node", "/packageManager"] },
+    { "name": "nvmrc", "file": ".nvmrc" },
+    { "name": "node-version", "file": ".node-version" }
+  ]
+}

@@ -1,0 +1,62 @@
+# Itse's budgets, checked by scripts/budget.py (design §11, §12.1). Every gate fails closed.
+
+# `rustc -V` must start with `rustc <toolchain> ` (rust-toolchain.toml pins the same).
+toolchain = "1.92.0"
+
+# The release build with +crt-static: at most 5 MiB, and static (no PT_INTERP).
+[size]
+bin = "itse"
+limit = 5242880
+static = true
+
+# `cargo tree -e normal,build` per target. Each target's set must be a subset of `allow`, and
+# their union must equal it: libc arrives through cpufeatures on aarch64 only, so x86_64 has 24.
+[crates]
+limit = 60
+targets = ["aarch64-unknown-linux-gnu", "x86_64-unknown-linux-gnu"]
+allow = [
+    "itse", "anyhow", "block-buffer", "cfg-if", "const-oid", "cpufeatures", "crypto-common", "digest", "hybrid-array",
+    "itoa", "lexopt", "libc", "memchr", "proc-macro2", "quote", "regex-lite", "serde", "serde_core", "serde_derive",
+    "serde_json", "sha2", "syn", "typenum", "unicode-ident", "zmij",
+]
+
+# Code lines after `cargo fmt`: non-blank, not comment-only, up to a file's first column-0
+# #[cfg(test)]; tests.rs, *_tests.rs and tests/ don't count. A module is src/<m>.rs plus
+# src/<m>/**; one without a cap fails. The caps are the table of design §11.2, re-baselined in S0.
+# The owner, 2026-11-05: "this 5k lines budget was a good estimate but don't take it too seriously.
+# loosen up a bit". So the total is 7,000 and the per-module caps only warn.
+[lines]
+limit = 7000
+caps_hard = false
+
+[lines.caps]
+main = 150
+sys = 170
+workspace = 93
+rpc = 200
+daemon = 250
+results = 294
+usage = 265
+verbs = 568
+mcp = 300
+manifest = 567
+resolve = 240
+lock = 243
+store = 320
+pins = 70
+env = 140
+actions = 231
+parse = 257
+host = 260
+lsp = 330
+dap = 240
+
+# Non-blank lines in each ext/<id>/ and in bench/src.
+[ext_lines]
+limit = 1000
+
+# The daemon's VmHWM in the scripted session (§12.2). On since S1 (it fails if src/daemon.rs exists
+# while it is off, so it can't be turned off silently); the session's MCP part joins with `itse mcp`.
+[rss]
+enabled = true
+limit_kb = 20480

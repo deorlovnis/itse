@@ -1,0 +1,43 @@
+{
+  "itse_ext": 1,
+  "id": "gradle",
+  "version": "0.1.0",
+  "requires": ["jdk"],
+  "detect": ["gradlew", "settings.gradle.kts", "settings.gradle"],
+  "actions": [
+    {
+      "label": "gradle:test",
+      "type": "process",
+      "command": "${workspaceFolder}/gradlew",
+      "group": { "kind": "test", "isDefault": true },
+      "args": ["${input:target}:test", "--console=plain", "--continue", "${filter_args}"],
+      "filter_args": ["--tests", "${input:filter}"],
+      "parse": ["junit-xml:**/build/test-results/**/TEST-*.xml"],
+      "problemMatcher": ["$kotlinc"],
+      "frames": {
+        "regexp": "^\\s+at ([\\w.$]+)\\.([^.(]+)\\(([^:()]+):(\\d+)\\)$",
+        "file": 3,
+        "line": 4,
+        "collapse": ["^(java|jdk|sun|kotlin\\.coroutines|org\\.junit|org\\.gradle|org\\.springframework)\\."]
+      },
+      "classify": [{ "regexp": "Could not find a valid Docker environment", "class": "environment", "note": "docker unavailable" }],
+      "drop_lines": ["^Picked up JAVA_TOOL_OPTIONS"],
+      "outputs": ["build/", ".gradle/", "*/build/"],
+      "executes_project_code": true
+    },
+    {
+      "label": "gradle:build",
+      "type": "process",
+      "command": "${workspaceFolder}/gradlew",
+      "group": { "kind": "build", "isDefault": true },
+      "args": ["${input:target}:assemble", "--console=plain"],
+      "problemMatcher": ["$kotlinc"],
+      "drop_lines": ["^Picked up JAVA_TOOL_OPTIONS"],
+      "outputs": ["build/", ".gradle/", "*/build/"],
+      "executes_project_code": true
+    }
+  ],
+  "project_pins": [
+    { "name": "gradle-wrapper", "file": "gradle/wrapper/gradle-wrapper.properties", "keys": ["distributionUrl", "distributionSha256Sum"] }
+  ]
+}

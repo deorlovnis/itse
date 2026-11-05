@@ -1,0 +1,55 @@
+{
+  "itse_ext": 1,
+  "id": "kotlin",
+  "version": "0.1.0",
+  "requires": ["jdk"],
+  "detect": ["settings.gradle.kts", "build.gradle.kts"],
+  "packages": {
+    "kotlin-lsp": {
+      "purl": "pkg:generic/jetbrains/kotlin-lsp",
+      "install": "fetch",
+      "pin_source": { "kind": "openvsx-bundle", "extension": "JetBrains/kotlin-server", "platforms": { "linux_arm64": "linux-arm64", "linux_x64": "linux-x64" } },
+      "archive": "tar.gz",
+      "strip": 1,
+      "bin": { "kotlin-lsp": "bin/intellij-server" },
+      "hosts": ["open-vsx.org", "download.jetbrains.com"],
+      "expires_after_days": 30,
+      "exit_codes": { "7": "server_expired", "11": "needs_consent:eula" },
+      "consents": [
+        { "id": "eula", "kind": "hash", "of_file": "EULA.txt", "hex_prefix": 16, "flag": "--eula=" },
+        { "id": "region", "kind": "choice", "env": "INTELLIJ_REGION" },
+        { "id": "data_sharing", "kind": "choice", "env": "INTELLIJ_DATA_SHARING", "values": ["none", "anonymous", "full"] }
+      ],
+      "jvm_args": ["-Xmx2g"],
+      "jvm_args_env": "IJ_JAVA_OPTIONS",
+      "executes_project_code": true
+    }
+  },
+  "servers": [
+    {
+      "id": "kotlin-lsp",
+      "protocol": "lsp",
+      "transport": "stdio",
+      "command": ["${pkg:kotlin-lsp}/bin/intellij-server", "--stdio", "--system-path=${cache}/kotlin-lsp", "${consent:eula}"],
+      "filetypes": ["kt", "kts"],
+      "languages": { "kt": "kotlin", "kts": "kotlin" },
+      "env": { "JAVA_HOME": "${pkg:jdk}" },
+      "init_options": { "defaultSdk": "${pkg:jdk}", "buildTools": ["gradle"] }
+    },
+    {
+      "id": "kotlin-dap",
+      "protocol": "dap",
+      "adapter_id": "intellij_debugger",
+      "via": { "lsp_command": { "server": "kotlin-lsp", "command": "start_debug_server" } },
+      "hide_vars": ["^\\$i\\$a\\$"]
+    }
+  ],
+  "problemMatchers": {
+    "kotlinc": {
+      "owner": "kotlinc",
+      "fileLocation": "absolute",
+      "pattern": { "regexp": "^([ew]): file://([^:]+):(\\d+):(\\d+) (.*)$", "severity": 1, "file": 2, "line": 3, "column": 4, "message": 5 }
+    }
+  },
+  "skills": [{ "name": "kotlin-module-scoped", "text": "Gradle runs per module: itse test :data." }]
+}
