@@ -122,6 +122,14 @@ fn untrusted_workspace_runs_no_project_code() {
     let r = fx.resolve();
     assert_eq!(r.launches.len(), 1);
     assert_eq!((r.launches[0].argv.clone(), &r.launches[0].cwd), (vec![ra.display().to_string()], &fx.ws.root));
+    // Its cargo check builds under the cache, per workspace, never in the repo's target/.
+    let target = fx.dirs.cache.join("rust-analyzer").join(&fx.ws.ws).display().to_string();
+    assert_eq!((&r.launches[0].settings["rust-analyzer"]["cargo"]["targetDir"], &r.launches[0].init_options["cargo"]["targetDir"]), (&json!(target), &json!(target)));
+    // A type whose name fuzzy-matches a function's would hide it under rust-analyzer's default (types only).
+    let search = json!({"kind": "all_symbols", "limit": 1000});
+    assert_eq!((&r.launches[0].settings["rust-analyzer"]["workspace"]["symbol"]["search"], &r.launches[0].init_options["workspace"]["symbol"]["search"]), (&search, &search));
+    assert_eq!(r.launches[0].init_options, r.launches[0].settings["rust-analyzer"], "its init options are its settings section, declared once");
+    assert_eq!(r.launches[0].outputs, ["Cargo.lock"], "its cargo metadata makes a missing lock file");
     let found: BTreeMap<String, lock::Found> = lock::read(&fx.dirs.state.join("found.json")).unwrap();
     assert_eq!((found["rust-analyzer"].path.as_str(), found["rust-analyzer"].sha256.as_str()), (ra.to_str().unwrap(), sys::sha256_hex(b"#!/bin/sh\n").as_str()));
 }

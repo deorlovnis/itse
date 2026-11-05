@@ -7,12 +7,12 @@
 //! built once per parse: `git ls-files` (with no hooks, fsmonitor or inherited `GIT_*`), else a walk that skips build output; at most 50K names.
 
 use std::path::Path;
-use std::process::{Command, Stdio};
 
 use regex_lite::Regex;
 
 use crate::manifest::{Classify, Frames};
 use crate::results::Loc;
+use crate::sys;
 
 /// The repo's file names, built on first use.
 pub struct Index<'a> {
@@ -32,14 +32,7 @@ impl<'a> Index<'a> {
     pub fn find(&mut self, dir: &str, file: &str) -> (Option<String>, bool) {
         let root = self.root;
         let (names, cut) = self.names.get_or_insert_with(|| {
-            // The repo's config could name commands (core.fsmonitor) and inherited GIT_* vars could
-            // point at another repo: neither applies, as the listing runs no project code.
-            let mut git = Command::new("git");
-            for (k, _) in std::env::vars_os().filter(|(k, _)| k.to_string_lossy().starts_with("GIT_")) {
-                git.env_remove(k);
-            }
-            git.envs([("GIT_CONFIG_NOSYSTEM", "1"), ("GIT_CONFIG_GLOBAL", "/dev/null")]).args(["-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null", "-C"]);
-            let git = git.arg(root).args(["ls-files", "-z"]).stdin(Stdio::null()).stderr(Stdio::null()).output();
+            let git = sys::git(root).args(["ls-files", "-z"]).output();
             let listed = git.ok().filter(|o| o.status.success() && !o.stdout.is_empty());
             let names = listed.map(|o| String::from_utf8_lossy(&o.stdout).split('\0').filter(|n| !n.is_empty()).take(INDEX_CAP + 1).map(String::from).collect::<Vec<_>>());
             let (mut names, _) = names.map_or_else(|| walk(root, &[".git", "build", "target", "node_modules"], INDEX_CAP + 1), |n| (n, false));

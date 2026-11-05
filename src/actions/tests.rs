@@ -9,7 +9,16 @@ fn resolved(actions: &str) -> Resolved {
     let e = parse_ext(&format!(r#"{{"itse_ext": 1, "id": "t", "actions": {actions}}}"#), "test").unwrap();
     let layer = Layer { uses: [("t".to_string(), BTreeMap::new())].into(), ..Layer::default() };
     let manifest = Manifest { exts: [("t".to_string(), (e, "added"))].into(), dev: Some((PathBuf::new(), layer)), team: None, team_bytes: vec![], notes: vec![] };
-    Resolved { manifest, states: vec![], launches: vec![], notes: vec![], trust_hash: String::new(), trusted: true, roots: [("tool".into(), "/store/tool".into())].into() }
+    Resolved {
+        manifest,
+        states: vec![],
+        launches: vec![],
+        notes: vec![],
+        trust_hash: String::new(),
+        trusted: true,
+        held: vec![],
+        roots: [("tool".into(), "/store/tool".into())].into(),
+    }
 }
 
 fn planned(actions: &str, label: &str, inputs: &[(&str, &str)], extra: &[&str]) -> Result<Plan> {

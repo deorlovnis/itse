@@ -10,9 +10,6 @@
 //! `~/.config/itse/workspaces/`, found by its `repo` field, so every worktree of a clone shares it.
 //! Itse writes nothing under a workspace root.
 
-// Fields that are not used yet (hosted servers, some action and matcher fields) are parsed and checked now.
-#![allow(dead_code)]
-
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -128,7 +125,10 @@ pub struct Server {
     pub filetypes: Vec<String>,
     pub languages: BTreeMap<String, String>,
     pub env: BTreeMap<String, String>,
+    /// `initializationOptions`; absent, the `settings` under the server's id (rust-analyzer reads
+    /// the same keys from both).
     pub init_options: Value,
+    /// What `workspace/configuration` and `didChangeConfiguration` get, by section.
     pub settings: Value,
     pub adapter_id: Option<String>,
     pub via: Option<DapVia>,
@@ -138,6 +138,9 @@ pub struct Server {
     pub limits: Limits,
     pub idle_minutes: Option<u64>,
     pub timeout_s: Option<u64>,
+    /// What the server itself writes into the workspace, like an action's `outputs`: rust-analyzer's
+    /// `cargo metadata` makes a missing `Cargo.lock`.
+    pub outputs: Vec<String>,
     pub executes_project_code: bool,
 }
 
@@ -206,7 +209,7 @@ pub struct ActionOptions {
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
 pub enum Group {
-    Kind(String),
+    Kind(#[allow(dead_code)] String),
     Full {
         kind: String,
         #[serde(default, rename = "isDefault")]
@@ -397,8 +400,9 @@ pub const BUILT_INS: [(&str, &str); 7] = [
     ("rust", include_str!("../ext/rust/itse-ext.json")),
 ];
 
-/// Template fields; one ending in `:` takes an argument. Any other `${…}` fails at load.
-const FIELDS: [&str; 8] = ["pkg:", "consent:", "input:", "ready:", "workspaceFolder", "cache", "target_args", "filter_args"];
+/// Template fields; one ending in `:` takes an argument. Any other `${…}` fails at load. `${ws}`
+/// is the workspace id, so a server's own folder under `${cache}` is per workspace (servers only).
+const FIELDS: [&str; 9] = ["pkg:", "consent:", "input:", "ready:", "workspaceFolder", "cache", "ws", "target_args", "filter_args"];
 
 /// `s` with each `${field}` replaced by what `fill` gives for it; an unknown field, or one `fill`
 /// has no value for, is an error that names it.
@@ -463,6 +467,7 @@ pub struct Use {
     pub id: String,
     pub settings: BTreeMap<String, Value>,
     pub team: bool,
+    #[allow(dead_code)] // for `status` to say why an extension is in use
     pub by: Option<String>,
 }
 

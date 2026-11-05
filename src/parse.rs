@@ -20,6 +20,7 @@ use regex_lite::{Captures, Regex};
 use serde::{Deserialize, Serialize};
 
 use crate::actions::RunRecord;
+use crate::lsp::Pushed;
 use crate::manifest::{Action, Extension, Manifest, Matcher, MatcherRef, OneOrMany, Pattern};
 use crate::results::{Item, Loc, Outcome, Store, Verdict};
 use crate::sys;
@@ -27,11 +28,12 @@ use crate::workspace::{Dirs, Workspace};
 
 /// One entry of `baselines.json`, keyed by `<via>:<session key>`: the fingerprints last
 /// returned under that key, so `problems --new` gives the delta. Each keeps its kind and path, so a
-/// scoped call (or one without `--all`) replaces only the part it showed.
+/// scoped call (or one without `--all`) replaces only the part it showed, then its sources, so a
+/// server that wasn't asked keeps its part.
 #[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Baseline {
-    pub fingerprints: BTreeMap<String, [String; 2]>,
+    pub fingerprints: BTreeMap<String, Vec<String>>,
     pub at: String,
 }
 
@@ -220,20 +222,33 @@ impl Parsed {
     }
 }
 
-fn plural(n: usize, word: &str) -> String {
+pub fn plural(n: usize, word: &str) -> String {
     format!("{n} {word}{}", if n == 1 { "" } else { "s" })
 }
 
-/// sha256 of (path, message with digits as `#`, trimmed source line): it holds when lines move.
-/// The tool is left out, so one problem reported by two tools merges into one item.
+/// sha256 of (path, message head with digits as `#`, trimmed source line): it holds when lines
+/// move. The tool is left out, so one problem reported by two tools merges into one item; so is
+/// the detail, which a server adds and a compiler's one-line form lacks, except a failed test's
+/// message; and so is what follows the message's first `: ` after a space (after a code such as
+/// `E0277: `) unless a quoted name follows, since rustc's short form appends the span's label
+/// there, and rust-analyzer doesn't.
 pub fn fingerprint(it: &Item) -> String {
-    let msg: String = it.msg.chars().chain(it.detail.first().into_iter().flat_map(|d| d.chars())).map(|c| if c.is_ascii_digit() { '#' } else { c }).collect();
+    let detail = it.detail.first().filter(|_| it.kind == "failed");
+    let msg: String = head(&it.msg).chars().chain(detail.into_iter().flat_map(|d| d.chars())).map(|c| if c.is_ascii_digit() { '#' } else { c }).collect();
     let (path, line) = (it.loc.as_ref().map_or("", |l| l.path.as_str()), it.src.first().map_or("", |s| s.1.trim()));
     sys::sha256_hex([it.kind.as_str(), path, &msg, line].join("\0").as_bytes())
 }
 
-/// Merge duplicates (one fingerprint at one place, as when a lib and its tests both report it;
-/// their sources joined), order by severity, path and line, and number the ids per kind: E1, W1,
+/// A message up to its first `: ` that follows a space and doesn't lead to a quoted name: `E0277:
+/// cannot add`, not its label, but all of `unused variable: `x``, which another name makes another problem.
+fn head(msg: &str) -> &str {
+    let cut = msg.match_indices(": ").map(|(i, _)| i).find(|&i| msg[..i].contains(' ') && !msg[i + 2..].starts_with('`'));
+    &msg[..cut.unwrap_or(msg.len())]
+}
+
+/// Merge duplicates (one fingerprint at one place, as when a lib and its tests both report it, or
+/// a compiler and a language server; their sources joined, the longer message kept), order by
+/// severity, path and line, and number the ids per kind: E1, W1,
 /// I1, H1, and T1 for failed tests. Alike problems on different lines stay apart.
 pub fn merge(items: Vec<Item>) -> Vec<Item> {
     let mut out: Vec<(String, Item)> = Vec::new();
@@ -241,7 +256,14 @@ pub fn merge(items: Vec<Item>) -> Vec<Item> {
     for it in items {
         let fp = fingerprint(&it);
         match out.iter_mut().find(|(f, kept)| *f == fp && at(kept) == at(&it)) {
-            Some((_, kept)) => kept.sources.extend(it.sources.into_iter().filter(|s| !kept.sources.contains(s)).collect::<BTreeSet<_>>()),
+            Some((_, kept)) => {
+                if it.msg.len() > kept.msg.len() {
+                    kept.msg = it.msg;
+                    let msg = &kept.msg;
+                    kept.detail.retain(|d| !msg.ends_with(d.as_str()));
+                }
+                kept.sources.extend(it.sources.into_iter().filter(|s| !kept.sources.contains(s)).collect::<BTreeSet<_>>())
+            }
             None => out.push((fp, it)),
         }
     }
@@ -258,16 +280,19 @@ pub fn merge(items: Vec<Item>) -> Vec<Item> {
     out.into_iter().map(|(_, it)| it).map(number).collect()
 }
 
-/// `problems [scope] [--new] [--all]` over the newest result of each action (LSP diagnostics are not
-/// joined yet): merged, errors first, hints only with `--all`, in `scope` (a repo-relative prefix).
-/// `--new` shows only what the caller's baseline key `via:session` wasn't given by its last
-/// `--new`, counts the unchanged and fixed, and replaces the part of that key's baseline it shows
-/// in `baselines.json`; a plain call leaves the baseline as it is, and so does one while a run is
-/// still being parsed (not settled), so its problems are reported by the next call.
-pub fn problems(store: &Store, scope: &str, all: bool, new: bool, key: &str) -> Result<Outcome> {
+/// `problems [scope] [--new] [--all]` over the newest result of each action and the diagnostics the
+/// language servers `pushed`: merged, errors first, hints only with `--all`, in `scope` (a
+/// repo-relative prefix). `--new` shows only what the caller's baseline key `via:session` wasn't
+/// given by its last `--new`, counts the unchanged and fixed, and replaces the part of that key's
+/// baseline it shows in `baselines.json`; a plain call leaves the baseline as it is, and so does one
+/// while a run is still being parsed or a server hasn't `settled`, so what it missed is reported by
+/// the next call. The baseline's problems from a `held` server, which wasn't asked, stay in it and
+/// are not counted fixed.
+pub fn problems(store: &Store, scope: &str, all: bool, new: bool, key: &str, pushed: &mut Pushed) -> Result<Outcome> {
+    let (mut settled, held) = (pushed.settled, &pushed.held);
     let mut runs: Vec<u64> = fs::read_dir(store.0.join("runs")).into_iter().flatten().flatten().filter_map(|e| e.file_name().to_str()?.parse().ok()).collect();
     runs.sort_unstable_by(|a, b| b.cmp(a));
-    let (mut labels, mut items, mut notes, mut settled) = (BTreeSet::new(), Vec::new(), Vec::new(), true);
+    let (mut labels, mut items, mut notes) = (BTreeSet::new(), std::mem::take(&mut pushed.items), Vec::new());
     for n in runs {
         let dir = store.0.join(format!("runs/{n}"));
         // run.json is small; a result is read only for the newest ended run of each label.
@@ -297,13 +322,16 @@ pub fn problems(store: &Store, scope: &str, all: bool, new: bool, key: &str) -> 
             (items, counts)
         }
         true => {
+            let shown = |e: &[String]| shown(e.first().map_or("", String::as_str), e.get(1).map_or("", String::as_str));
+            let held = |e: &[String]| e.iter().skip(2).any(|s| held.contains(s));
             let next = |b: &Baseline| {
-                let kept = b.fingerprints.iter().filter(|(_, [k, p])| !shown(k, p)).map(|(f, kp)| (f.clone(), kp.clone()));
-                Baseline { fingerprints: kept.chain(view.iter().map(|(f, i)| (f.clone(), [i.kind.clone(), path(i)]))).collect(), at: sys::utc(SystemTime::now()) }
+                let kept = b.fingerprints.iter().filter(|(_, e)| !shown(e) || held(e)).map(|(f, e)| (f.clone(), e.clone()));
+                let entry = |i: &Item| [i.kind.clone(), path(i)].into_iter().chain(i.sources.iter().cloned()).collect();
+                Baseline { fingerprints: kept.chain(view.iter().map(|(f, i)| (f.clone(), entry(i)))).collect(), at: sys::utc(SystemTime::now()) }
             };
             let before = baseline(&store.0, key, settled.then_some(&next))?;
             let fresh: Vec<Item> = view.iter().filter(|(f, _)| !before.fingerprints.contains_key(f)).map(|(_, i)| i.clone()).collect();
-            let fixed = before.fingerprints.iter().filter(|(f, [k, p])| shown(k, p) && !view.iter().any(|(v, _)| v == *f)).count();
+            let fixed = before.fingerprints.iter().filter(|(f, e)| shown(e) && !held(e) && !view.iter().any(|(v, _)| v == *f)).count();
             let since = before.at.get(11..19).map_or(String::new(), |t| format!(" since {t}"));
             let counts = format!("{}; {} unchanged, {fixed} fixed{since}", counts(&fresh, "new "), view.len() - fresh.len());
             notes.extend((!settled).then(|| "not settled: the baseline is not advanced".to_string()));

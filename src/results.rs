@@ -314,7 +314,7 @@ impl Store {
 
     /// The newest result holding item `item`: this session's first, else any, so a bare `T1` means
     /// the T1 this caller last saw.
-    fn holding(&self, item: &str, session: &str) -> Option<(String, Outcome)> {
+    pub fn holding(&self, item: &str, session: &str) -> Option<(String, Outcome)> {
         let ids = self.list().into_iter().filter_map(|(path, _)| Some(format!("q:{}", path.file_stem()?.to_str()?)));
         let found: Vec<(String, (Outcome, String))> =
             ids.filter_map(|id| Some((id.clone(), self.load(&id).ok()?))).filter(|(_, (o, _))| o.items.iter().any(|i| i.id == item)).collect();

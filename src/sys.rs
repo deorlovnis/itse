@@ -3,11 +3,9 @@
 //!
 //! No libc crate (as Halti): six calls with Linux constants, each behind a small safe function.
 
-// Some calls are not used yet; the tests cover them.
-#![allow(dead_code)]
-
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -29,6 +27,8 @@ pub const RLIMIT_CORE: i32 = 4;
 pub const RLIMIT_NOFILE: i32 = 7;
 pub const RLIMIT_AS: i32 = 9;
 const M_ARENA_MAX: i32 = -8;
+/// An `open` flag: a FIFO opens at once instead of waiting for a writer.
+pub const O_NONBLOCK: i32 = 0o4000;
 
 mod ffi {
     unsafe extern "C" {
@@ -149,6 +149,36 @@ pub fn kill_group(pgid: i32, grace: Duration, mut reap: impl FnMut()) {
 /// the daemon's lifetime.
 pub fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// `git -C root` for a read-only listing that runs no project code. The repo's config can name
+/// commands: core.fsmonitor and hooks are turned off, and so is every filter driver it (or a file
+/// it includes) declares, since git runs a file's clean or process filter whenever it rehashes a
+/// file whose stat changed; each `filter.*` key is blanked through `GIT_CONFIG_KEY_n`, which takes
+/// any subsection name, and a blank `required` is false. Listing them reads config only. No
+/// transport may run (`GIT_ALLOW_PROTOCOL` empty overrides the repo's `protocol.*.allow`), so a
+/// partial clone fetches nothing. `GIT_*` vars inherited from a git hook could point at another
+/// repo or index, so none applies. Optional locks are off: it never takes `.git/index.lock` or
+/// rewrites the index.
+pub fn git(root: &Path) -> process::Command {
+    let base = || {
+        let mut git = process::Command::new("git");
+        for (k, _) in env::vars_os().filter(|(k, _)| k.to_string_lossy().starts_with("GIT_")) {
+            git.env_remove(k);
+        }
+        git.envs([("GIT_CONFIG_NOSYSTEM", "1"), ("GIT_CONFIG_GLOBAL", "/dev/null"), ("GIT_OPTIONAL_LOCKS", "0"), ("GIT_ALLOW_PROTOCOL", "")]);
+        git.args(["--no-optional-locks", "-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null", "-C"]).arg(root);
+        git.stdin(process::Stdio::null()).stderr(process::Stdio::null());
+        git
+    };
+    let filters = base().args(["config", "-z", "--name-only", "--get-regexp", r"^filter\."]).output().map_or(vec![], |o| o.stdout);
+    let mut git = base();
+    let keys: Vec<&[u8]> = filters.split(|&b| b == 0).filter(|k| !k.is_empty()).collect();
+    git.env("GIT_CONFIG_COUNT", keys.len().to_string());
+    for (i, key) in keys.iter().enumerate() {
+        git.env(format!("GIT_CONFIG_KEY_{i}"), std::ffi::OsStr::from_bytes(key)).env(format!("GIT_CONFIG_VALUE_{i}"), "");
+    }
+    git
 }
 
 // --- private files ---

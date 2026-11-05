@@ -3,6 +3,7 @@ use std::ffi::OsString;
 use std::io;
 use std::os::unix::fs::{MetadataExt, symlink};
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use super::*;
 use crate::results::Verdict;
@@ -332,10 +333,15 @@ fn gc_removes_read_only_packages_no_lock_pins() {
     let (dl, held) = (fx.dirs.data.join("dl"), sys::sha256_hex(b"held"));
     let guard = File::create(dl.join(format!("{held}.lock"))).unwrap();
     guard.lock().unwrap();
-    let removed = gc(&fx.dirs).unwrap();
+    let (mut removed, b_lock) = (vec![], format!("{}.lock", sys::sha256_hex(&b)));
+    let gone_too = soon(|| {
+        removed.extend(gc(&fx.dirs).unwrap());
+        removed.contains(&b_lock)
+    });
+    assert!(gone_too, "{removed:?}");
     assert_eq!(removed.len(), 3, "{removed:?}");
     assert!(kept.is_dir() && !gone.exists());
-    assert!(removed.contains(&format!("sha256-{}", sys::sha256_hex(&b))) && removed.contains(&format!("{}.lock", sys::sha256_hex(&b))), "its install lock goes too");
+    assert!(removed.contains(&format!("sha256-{}", sys::sha256_hex(&b))) && removed.contains(&b_lock), "its install lock goes too");
     assert!(dl.join(format!("{held}.lock")).exists() && dl.join(format!("{}.lock", sys::sha256_hex(&a))).exists(), "a held or pinned install lock stays");
 }
 
@@ -367,8 +373,24 @@ fn leftover_tmp_dirs_are_removed_at_start_unless_an_install_holds_them() {
     clean(&fx.dirs);
     assert!(!dead.exists() && live.exists());
     drop(held);
-    clean(&fx.dirs);
-    assert!(!live.exists());
+    assert!(soon(|| {
+        clean(&fx.dirs);
+        !live.exists()
+    }));
+}
+
+/// `done`, tried again for up to 2 s: a test elsewhere in this process that forks while a lock here
+/// is held gives the child a copy of it until the child's exec, so for that moment a released lock
+/// looks held, as it may to a daemon's gc or start, which then leaves its file for the next one.
+fn soon(mut done: impl FnMut() -> bool) -> bool {
+    let end = Instant::now() + Duration::from_secs(2);
+    while !done() {
+        if Instant::now() >= end {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    true
 }
 
 #[test]

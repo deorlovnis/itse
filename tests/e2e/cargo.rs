@@ -26,10 +26,28 @@ fn rust_ws(env: &Env, trust: bool) -> Option<PathBuf> {
     Some(work)
 }
 
-/// `itse ARGS` in the work folder: (exit code, stdout and stderr).
+/// `itse ARGS` in the work folder, rust-analyzer off PATH: (exit code, stdout and stderr).
 fn itse(env: &Env, args: &[&str]) -> (Option<i32>, String) {
-    let out = env.itse(&env.work(), args);
+    let out = env.command(&env.work(), args).env("PATH", path_without_ra(env)).output().unwrap();
     (out.status.code(), stdout(&out) + &String::from_utf8_lossy(&out.stderr))
+}
+
+/// PATH without rust-analyzer, so `problems` here holds only the actions' problems: a PATH dir that
+/// holds it stands in as a dir of links to the rest of its files.
+fn path_without_ra(env: &Env) -> String {
+    let shadow = env.dir.join("bin");
+    let dirs = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()).collect::<Vec<_>>();
+    let dirs = dirs.into_iter().map(|dir| {
+        if !dir.join("rust-analyzer").exists() {
+            return dir;
+        }
+        fs::create_dir_all(&shadow).unwrap();
+        for e in fs::read_dir(&dir).unwrap().flatten().filter(|e| e.file_name() != "rust-analyzer") {
+            let _ = std::os::unix::fs::symlink(e.path(), shadow.join(e.file_name()));
+        }
+        shadow.clone()
+    });
+    std::env::join_paths(dirs).unwrap().into_string().unwrap()
 }
 
 fn break_lib(work: &Path) {
@@ -103,7 +121,8 @@ fn two_default_test_actions_are_an_error_with_candidates() {
 fn problems_new_gives_a_delta_across_two_cli_calls() {
     let env = Env::new();
     let Some(work) = rust_ws(&env, true) else { return };
-    assert_eq!(itse(&env, &["problems"]), (Some(0), "EMPTY problems — 0 errors, 0 warnings\n".into()), "no action has run");
+    let none = "EMPTY problems — 0 errors, 0 warnings\nrust-analyzer not ready: its diagnostics are not included\n";
+    assert_eq!(itse(&env, &["problems"]), (Some(0), none.into()), "no action has run, and rust-analyzer is off PATH");
     break_lib(&work);
     assert_eq!(itse(&env, &["build"]).0, Some(1));
     let (code, text) = itse(&env, &["problems", "--new"]);
@@ -146,8 +165,9 @@ fn a_run_that_outlasts_the_wait_is_parsed_when_it_ends() {
     assert!(code == Some(1) && text.starts_with("FAIL problems — 1 error, 0 warnings; q:1\n"), "{text}");
 }
 
-/// `problems --new` over a hook-mode connection with this session id, as `itse hook` will call it.
-fn hook_problems(env: &Env, session: &str) -> String {
+/// `problems --new` over a hook-mode connection with this session id and the test's PATH, as
+/// `itse hook` will call it.
+pub(super) fn hook_problems(env: &Env, session: &str) -> String {
     let conn = UnixStream::connect(env.socket()).unwrap();
     let mut reader = BufReader::new(conn.try_clone().unwrap());
     let mut ask = |method: &str, params: Value| {
@@ -156,7 +176,7 @@ fn hook_problems(env: &Env, session: &str) -> String {
         reader.read_line(&mut line).unwrap();
         serde_json::from_str::<Value>(&line).unwrap()["result"].clone()
     };
-    ask("hello", json!({"proto": 1, "mode": "hook", "env": {"ITSE_SESSION": session}}));
+    ask("hello", json!({"proto": 1, "mode": "hook", "env": {"ITSE_SESSION": session, "PATH": std::env::var("PATH").unwrap_or_default()}}));
     ask("call", json!({"verb": "problems", "args": ["--new"]}))["text"].as_str().unwrap().to_string()
 }
 

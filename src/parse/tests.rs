@@ -28,6 +28,11 @@ fn cargo_test(root: &Path, log: &str) -> Parsed {
     run(root, a, &named, &tmp.0.join("out.log"), SystemTime::now()).unwrap()
 }
 
+/// What `problems` gets from servers that all settled and pushed nothing.
+fn settled() -> Pushed {
+    Pushed { settled: true, ..Pushed::default() }
+}
+
 fn lines(it: &Item) -> String {
     let loc = it.loc.as_ref().map_or(String::new(), |l| format!("{}:{}:{}", l.path, l.line, l.col));
     let src = it.src.iter().map(|(n, t)| format!("\n{n} | {t}")).collect::<String>();
@@ -347,11 +352,11 @@ fn a_scoped_new_call_replaces_only_the_baseline_it_shows() {
     let tmp = TempDir::new("itse-parse");
     let (a, t) = (item("error", "src/a.rs", 3, "bad", "a", "rustc"), item("error", "tests/t.rs", 4, "worse", "t", "rustc"));
     let store = runs(&tmp.0, &[(1, "cargo:build", Some(vec![a.clone(), t.clone()]))]);
-    assert_eq!(problems(&store, "", false, true, "cli:cli").unwrap().counts, "2 new errors, 0 new warnings; 0 unchanged, 0 fixed");
+    assert_eq!(problems(&store, "", false, true, "cli:cli", &mut settled()).unwrap().counts, "2 new errors, 0 new warnings; 0 unchanged, 0 fixed");
     runs(&tmp.0, &[(2, "cargo:build", Some(vec![a, item("error", "tests/t.rs", 4, "worst", "t", "rustc")]))]);
-    let scoped = problems(&store, "tests/", false, true, "cli:cli").unwrap();
+    let scoped = problems(&store, "tests/", false, true, "cli:cli", &mut settled()).unwrap();
     assert!(scoped.counts.starts_with("1 new error, 0 new warnings; 0 unchanged, 1 fixed since "), "{}", scoped.counts);
-    let whole = problems(&store, "", false, true, "cli:cli").unwrap();
+    let whole = problems(&store, "", false, true, "cli:cli", &mut settled()).unwrap();
     assert!(whole.counts.starts_with("0 new errors, 0 new warnings; 2 unchanged, 0 fixed since "), "src/a.rs stayed in the baseline: {}", whole.counts);
 }
 
@@ -359,10 +364,43 @@ fn a_scoped_new_call_replaces_only_the_baseline_it_shows() {
 fn an_unsettled_call_does_not_advance_the_baseline() {
     let tmp = TempDir::new("itse-parse");
     let store = runs(&tmp.0, &[(1, "cargo:build", Some(vec![])), (2, "cargo:build", None)]);
-    let o = problems(&store, "", false, true, "cli:cli").unwrap();
+    let o = problems(&store, "", false, true, "cli:cli", &mut settled()).unwrap();
     assert_eq!(o.notes, ["run:2 of cargo:build is still being parsed", "from cargo:build run:1, ended 2026-11-05T10:00:00.000Z", "not settled: the baseline is not advanced"]);
     assert!(!tmp.0.join("baselines.json").exists());
     runs(&tmp.0, &[(2, "cargo:build", Some(vec![item("error", "src/a.rs", 3, "bad", "a", "rustc")]))]);
-    let o = problems(&store, "", false, true, "cli:cli").unwrap();
+    let o = problems(&store, "", false, true, "cli:cli", &mut settled()).unwrap();
     assert_eq!((o.counts.as_str(), o.items.len()), ("1 new error, 0 new warnings; 0 unchanged, 0 fixed", 1), "the parsed run's error is new once settled");
+}
+
+#[test]
+fn a_compiler_and_a_language_server_reporting_one_error_merge() {
+    let item = |msg: &str, detail: &[&str], source: &str| Item {
+        kind: "error".into(),
+        loc: Some(Loc { path: "src/lib.rs".into(), line: 6, col: 7 }),
+        src: vec![(6, "    a + \"b\"".into())],
+        msg: msg.into(),
+        detail: detail.iter().map(|d| d.to_string()).collect(),
+        sources: vec![source.into()],
+        ..Item::default()
+    };
+    // rustc's short form appends the span's label; rust-analyzer puts notes on the lines after.
+    let ra = item("E0277: cannot add `&str` to `u32`", &["no implementation for `u32 + &str`", "the trait `Add<&str>` is not implemented for `u32`"], "rust-analyzer");
+    let rustc = item("E0277: cannot add `&str` to `u32`: no implementation for `u32 + &str`", &[], "rustc");
+    assert_eq!(fingerprint(&ra), fingerprint(&rustc));
+    let merged = merge(vec![ra, rustc]);
+    assert_eq!(merged.len(), 1, "{merged:?}");
+    assert_eq!(merged[0].detail, ["the trait `Add<&str>` is not implemented for `u32`"], "the label is said once");
+    assert_eq!(
+        (merged[0].msg.as_str(), merged[0].sources.clone()),
+        ("E0277: cannot add `&str` to `u32`: no implementation for `u32 + &str`", vec!["rust-analyzer".to_string(), "rustc".into()])
+    );
+    let unused = |name: &str| fingerprint(&item(&format!("unused_variables: unused variable: `{name}`"), &[], "rust-analyzer"));
+    assert_ne!(unused("x"), unused("y"), "a quoted name is part of the message, not a label");
+    let other = item("E0308: mismatched types", &[], "rust-analyzer");
+    assert_ne!(fingerprint(&other), fingerprint(&merged[0]), "another error at the same place stays apart");
+    let mut settled = settled();
+    settled.items = vec![other];
+    let tmp = TempDir::new("itse-parse");
+    let o = problems(&Store(tmp.0.clone()), "", false, false, "cli:cli", &mut settled).unwrap();
+    assert_eq!(o.counts, "1 error, 0 warnings", "pushed items are counted with the actions'");
 }

@@ -50,17 +50,31 @@
       "languages": {
         "rs": "rust"
       },
-      "init_options": {
-        "checkOnSave": true,
-        "cargo": {
-          "buildScripts": {
+      "settings": {
+        "rust-analyzer": {
+          "checkOnSave": true,
+          "workspace": {
+            "symbol": {
+              "search": {
+                "kind": "all_symbols",
+                "limit": 1000
+              }
+            }
+          },
+          "cargo": {
+            "buildScripts": {
+              "enable": true
+            },
+            "targetDir": "${cache}/rust-analyzer/${ws}"
+          },
+          "procMacro": {
             "enable": true
           }
-        },
-        "procMacro": {
-          "enable": true
         }
       },
+      "outputs": [
+        "Cargo.lock"
+      ],
       "executes_project_code": true
     }
   ],

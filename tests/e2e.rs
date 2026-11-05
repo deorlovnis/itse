@@ -65,6 +65,7 @@ impl Env {
             .env_remove("ITSE_WORKSPACE")
             .env_remove("ITSE_TEST_PROTO")
             .env_remove("ITSE_TEST_SLOW_MS")
+            .env_remove("ITSE_TEST_SETTLE_MS")
             .env_remove("ITSE_TEST_STOP_MS")
             .stdin(Stdio::null());
         cmd
@@ -937,3 +938,10 @@ mod store;
 mod actions;
 #[path = "e2e/cargo.rs"]
 mod cargo;
+
+// --- language servers ---
+
+#[path = "e2e/lsp.rs"]
+mod lsp;
+#[path = "e2e/ra.rs"]
+mod ra;

@@ -5,8 +5,9 @@
 //! A daemon verb whose body is not built yet answers `ERROR … not built yet`. Built now: `status`,
 //! `show` and the index, and through the CLI `daemon`, `mcp` and `stats`; the manifest's verbs:
 //! `use`, `unuse`, `ext`, `trust` and `consent`, the store's: `install`, `lock` and `gc`, and status
-//! rows; `run`, `build`, `test`, `cancel` and `stop` (in `actions`) and `problems` over action
-//! results (in `parse`).
+//! rows; `run`, `build`, `test`, `cancel` and `stop` (in `actions`), `problems` over action
+//! results (in `parse`) and the language servers' diagnostics, and `find`, `refs`, `info` and
+//! `outline` on the language servers (in `lsp`).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
@@ -226,12 +227,37 @@ pub fn call(host: &Arc<Host>, caller: &Caller, params: &Value, cancel: &Cancel) 
             }
             "problems" => {
                 let (scope, all, new) = (args.target.as_deref().unwrap_or(""), args.flags.contains_key("all"), args.flags.contains_key("new"));
-                let o = parse::problems(&store, scope, all, new, &format!("{via}:{session}"));
+                // A debug-only seam for the tests of a server that doesn't settle in time.
+                let ms = caller.env.get("ITSE_TEST_SETTLE_MS").filter(|_| cfg!(debug_assertions)).and_then(|ms| ms.parse().ok());
+                // A hook waits 1.5 s at most: on a small crate rust-analyzer's push that says what an edit
+                // to a file no query opened did comes under 0.2 s after it (p95), the hook's whole call
+                // under 0.6 s with the settle's quiet; a bigger crate's check past that is unsettled.
+                let wait = Duration::from_millis(ms.unwrap_or(if via == "hook" { 1500 } else { 20_000 }));
+                let mut lsp = crate::lsp::problems(host, &caller.env, scope, via != "hook", wait, cancel);
+                lsp.settled &= !cancel.is_cancelled();
+                let o = parse::problems(&store, scope, all, new, &format!("{via}:{session}"), &mut lsp).map(|o| Outcome {
+                    counts: lsp.untrusted.iter().cloned().chain([o.counts.clone()]).chain(lsp.index).collect::<Vec<_>>().join("; "),
+                    // Before trust a server in scope never ran, so its problems are unknown, not none.
+                    verdict: if lsp.untrusted.is_some() { Verdict::Untrusted } else { o.verdict },
+                    err: if lsp.untrusted.is_some() { Some("untrusted") } else { o.err },
+                    states: lsp.states,
+                    notes: o.notes.iter().cloned().chain(lsp.notes).collect(),
+                    ..o
+                });
                 shape(o.unwrap_or_else(|e| Outcome::error("problems", "io", format!("{e:#}"))), &store, via, session, page)
             }
             "cancel" | "stop" => shape(stop(host, v.name, args.target.as_deref().unwrap_or_default()), &store, via, session, page),
+            "find" => {
+                let kind = args.flags.get("kind").and_then(Value::as_str);
+                shape(crate::lsp::find(host, &caller.env, args.target.as_deref().unwrap_or_default(), kind, cancel), &store, via, session, page)
+            }
+            "refs" => shape(crate::lsp::refs(host, &caller.env, session, args.target.as_deref().unwrap_or_default(), cancel), &store, via, session, page),
+            "info" => shape(crate::lsp::info(host, &caller.env, session, args.target.as_deref().unwrap_or_default(), cancel), &store, via, session, page),
+            "outline" => shape(crate::lsp::outline(host, &caller.env, &caller.cwd, args.target.as_deref().unwrap_or_default(), cancel), &store, via, session, page),
             "use" | "unuse" | "ext" | "trust" | "consent" => {
                 let o = manifest_verb(&host.ws, &host.dirs, &caller.env, &caller.cwd, v.name, &args, params["tty"] == true);
+                // A revoked trust or an unused extension leaves a server that may no longer run: it stops now.
+                let _ = crate::lsp::servers(host, &caller.env, v.name, "", &|_| false, false, cancel);
                 shape(o, &store, via, session, page)
             }
             _ => shape(Outcome::error(v.name, "internal", text("not_built", &[])), &store, via, session, 1),
@@ -407,10 +433,14 @@ fn pick(declared: &[&manifest::Action], verb: &str, args: &Args) -> Result<Strin
 /// as does one that already had); a server is stopped.
 pub fn stop(host: &Host, verb: &str, target: &str) -> Outcome {
     let Some(n) = target.strip_prefix("run:").filter(|n| n.parse::<u64>().is_ok()) else {
-        // Each registry lock is let go before the stop, which waits on the process.
-        let slot = sys::lock(&host.slots).get(target).cloned();
-        let stopped = slot.is_some_and(|s| verb == "stop" && s.stop(Duration::from_secs(3)));
-        return if stopped { Outcome::new(verb, Verdict::Stopped, target, "stopped") } else { Outcome::error(verb, "unknown_id", format!("{target} is not running")) };
+        // A server's bare id (`rust-analyzer`) names its handle when only one has it.
+        let named: Vec<String> = sys::lock(&host.slots).keys().filter(|h| h.split_once(':').is_some_and(|(_, id)| id == target)).cloned().collect();
+        let target = if let [one] = &named[..] { one.as_str() } else { target };
+        if verb == "stop" && host.stop_server(target, Duration::from_secs(5)) {
+            return Outcome::new(verb, Verdict::Stopped, target, "stopped");
+        }
+        let state = sys::lock(&host.slots).get(target).map_or(String::new(), |s| format!(" ({})", s.state()));
+        return Outcome::error(verb, "unknown_id", format!("{target} is not running{state}"));
     };
     let live = sys::lock(&host.runs).get(target).cloned();
     live.inspect(|run| actions::stop_run(run));
@@ -606,7 +636,8 @@ fn status(host: &Host, caller: &Caller, args: &Args, cancel: &Cancel) -> Outcome
     let counts = [(unready > 0).then(|| format!("{unready} of {} not ready", r.states.len() - suggested)), (suggested > 0).then(|| format!("{suggested} suggested"))];
     let counts = counts.into_iter().flatten().chain([format!("daemon pid {pid}")]).collect::<Vec<_>>().join("; ");
     let verdict = if unready > 0 { Verdict::Unready } else { Verdict::Ok };
-    Outcome { states: r.states, notes, ..Outcome::new("status", verdict, root.to_string(), counts) }
+    let servers = r.launches.iter().filter(|l| l.protocol == crate::host::Protocol::Lsp).map(|l| crate::lsp::row(host, l));
+    Outcome { states: r.states.iter().cloned().chain(servers).collect(), notes, ..Outcome::new("status", verdict, root.to_string(), counts) }
 }
 
 // --- daemon status and stop (CLI only) ---
