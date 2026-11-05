@@ -1,0 +1,24 @@
+{
+  "itse_ext": 1,
+  "id": "jdk",
+  "version": "0.1.0",
+  "packages": {
+    "jdk": {
+      "purl": "pkg:github/adoptium/temurin25-binaries",
+      "install": "fetch",
+      "pin_source": {
+        "kind": "github-release",
+        "repo": "adoptium/temurin25-binaries",
+        "assets": { "linux_arm64": "OpenJDK25U-jdk_aarch64_linux_hotspot_*.tar.gz", "linux_x64": "OpenJDK25U-jdk_x64_linux_hotspot_*.tar.gz" }
+      },
+      "archive": "tar.gz",
+      "strip": 1,
+      "bin": { "java": "bin/java", "javac": "bin/javac", "keytool": "bin/keytool" },
+      "hosts": ["api.github.com", "github.com", "release-assets.githubusercontent.com"]
+    }
+  },
+  "project_pins": [
+    { "name": "java-version", "file": ".java-version" },
+    { "name": "gradle-daemon-jvm", "file": "gradle/gradle-daemon-jvm.properties", "keys": ["toolchainVersion", "toolchainVendor"] }
+  ]
+}

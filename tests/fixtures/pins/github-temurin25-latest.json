@@ -1,0 +1,237 @@
+{
+  "url": "https://api.github.com/repos/adoptium/temurin25-binaries/releases/420463485",
+  "html_url": "https://github.com/adoptium/temurin25-binaries/releases/tag/jdk-25.0.5%2B8",
+  "id": 420463485,
+  "tag_name": "jdk-25.0.5+8",
+  "name": "jdk-25.0.5+8",
+  "draft": false,
+  "prerelease": false,
+  "created_at": "2024-12-11T11:03:57Z",
+  "published_at": "2026-10-22T08:18:33Z",
+  "assets": [
+    {
+      "name": "OpenJDK25U-jdk_aarch64_alpine-linux_hotspot_25.0.5_8.tar.gz",
+      "size": 139198266,
+      "digest": "sha256:d02eadc0a0f93faba4be38c8657eb8eef842103a4c7c2400f5827dbd90fc21c9",
+      "content_type": "application/gzip",
+      "browser_download_url": "https://github.com/adoptium/temurin25-binaries/releases/download/jdk-25.0.5%2B8/OpenJDK25U-jdk_aarch64_alpine-linux_hotspot_25.0.5_8.tar.gz"
+    },
+    {
+      "name": "OpenJDK25U-jdk_aarch64_alpine-linux_hotspot_25.0.5_8.tar.gz.json",
+      "size": 31267,
+      "digest": "sha256:0e1946097a83463a57beb0ba3cec7e341aa50d283e313497141699b3fe755aeb",
+      "content_type": "application/json",
+      "browser_download_url": "https://github.com/adoptium/temurin25-binaries/releases/download/jdk-25.0.5%2B8/OpenJDK25U-jdk_aarch64_alpine-linux_hotspot_25.0.5_8.tar.gz.json"
+    },
+    {
+      "name": "OpenJDK25U-jdk_aarch64_alpine-linux_hotspot_25.0.5_8.tar.gz.sha256.txt",
+      "size": 126,
+      "digest": "sha256:57127741fc6ed0d7ec0558a0fa5142de4c0bbb8040e6f734116d59fa01da9a6b",
+      "content_type": "text/plain",
+      "browser_download_url": "https://github.com/adoptium/temurin25-binaries/releases/download/jdk-25.0.5%2B8/OpenJDK25U-jdk_aarch64_alpine-linux_hotspot_25.0.5_8.tar.gz.sha256.txt"
+    },
+    {
+      "name": "OpenJDK25U-jdk_aarch64_alpine-linux_hotspot_25.0.5_8.tar.gz.sig",
+      "size": 310,
+      "digest": "sha256:dce611e688f3b097be50e4cd88f4096bfeee2f7fd497f10280cd95d48a49c9e2",
+      "content_type": "application/pgp-signature",
+      "browser_download_url": "https://github.com/adoptium/temurin25-binaries/releases/download/jdk-25.0.5%2B8/OpenJDK25U-jdk_aarch64_alpine-linux_hotspot_25.0.5_8.tar.gz.sig"
+    },
+    {
+      "name": "OpenJDK25U-jdk_aarch64_linux_hotspot_25.0.5_8.tar.gz",
+      "size": 140178170,
+      "digest": "sha256:bb5b2ded252f21c6090cf780b0a408ad0d83bbb557e702955643557f13231880",
+      "content_type": "application/gzip",
+      "browser_download_url": "https://github.com/adoptium/temurin25-binaries/releases/download/jdk-25.0.5%2B8/OpenJDK25U-jdk_aarch64_linux_hotspot_25.0.5_8.tar.gz"
+    },
+    {
+      "name": "OpenJDK25U-jdk_aarch64_linux_hotspot_25.0.5_8.tar.gz.json",
+      "size": 32566,
+      "digest": "sha256:5f2669483205fb5877f43a2c0c9968fe3822dbae4f3744c670822064e3183d01",
+      "content_type": "application/json",
+      "browser_download_url": "https://github.com/adoptium/temurin25-binaries/releases/download/jdk-25.0.5%2B8/OpenJDK25U-jdk_aarch64_linux_hotspot_25.0.5_8.tar.gz.json"
+    },
+    {
+      "name": "OpenJDK25U-jdk_aarch64_linux_hotspot_25.0.5_8.tar.gz.sha256.txt",
+      "size": 119,
+      "digest": "sha256:8df77f064e5d33d99bdf1a3c52323c7b3db92f7dab07d2cfb833471f4d134c33",
+      "content_type": "text/plain",
+      "browser_download_url": "https://github.com/adoptium/temurin25-binaries/releases/download/jdk-25.0.5%2B8/OpenJDK25U-jdk_aarch64_linux_hotspot_25.0.5_8.tar.gz.sha256.txt"
+    },
+    {
+      "name": "OpenJDK25U-jdk_aarch64_linux_hotspot_25.0.5_8.tar.gz.sig",
+      "size": 310,
+      "digest": "sha256:80f10e068014b5bcf1012400a57fc975d504b2e9d8d847c242346b44d7ad0b4c",
+      "content_type": "application/pgp-signature",
+      "browser_download_url": "https://github.com/adoptium/temurin25-binaries/releases/download/jdk-25.0.5%2B8/OpenJDK25U-jdk_aarch64_linux_hotspot_25.0.5_8.tar.gz.sig"
+    },
+    {
+      "name": "OpenJDK25U-jdk_x64_alpine-linux_hotspot_25.0.5_8.tar.gz",
+      "size": 140396080,
+      "digest": "sha256:efc86581260b73c340c313e7577c4c85d6a8a899edc3748d78bee5238fe44a4e",
+      "content_type": "application/gzip",
+      "browser_download_url": "https://github.com/adoptium/temurin25-binaries/releases/download/jdk-25.0.5%2B8/OpenJDK25U-jdk_x64_alpine-linux_hotspot_25.0.5_8.tar.gz"
+    },
+    {
+      "name": "OpenJDK25U-jdk_x64_alpine-linux_hotspot_25.0.5_8.tar.gz.json",
+      "size": 30760,
+      "digest": "sha256:7486a407095ebeabf722de3233718dd6c1c8a7263d545ba47222cb18b5cddcc0",
+      "content_type": "application/json",
+      "browser_download_url": "https://github.com/adoptium/temurin25-binaries/releases/download/jdk-25.0.5%2B8/OpenJDK25U-jdk_x64_alpine-linux_hotspot_25.0.5_8.tar.gz.json"
+    },
+    {
+      "name": "OpenJDK25U-jdk_x64_alpine-linux_hotspot_25.0.5_8.tar.gz.sha256.txt",
+      "size": 122,
+      "digest": "sha256:3d12ea467ce51473dfe78a39f0342797f3bcc25494d4e06201c68666b310907b",
+      "content_type": "text/plain",
+      "browser_download_url": "https://github.com/adoptium/temurin25-binaries/releases/download/jdk-25.0.5%2B8/OpenJDK25U-jdk_x64_alpine-linux_hotspot_25.0.5_8.tar.gz.sha256.txt"
+    },
+    {
+      "name": "OpenJDK25U-jdk_x64_alpine-linux_hotspot_25.0.5_8.tar.gz.sig",
+      "size": 310,
+      "digest": "sha256:246f39af9153ee2cb470b09c152390844e920e8d9d8d54b501dcee637627245d",
+      "content_type": "application/pgp-signature",
+      "browser_download_url": "https://github.com/adoptium/temurin25-binaries/releases/download/jdk-25.0.5%2B8/OpenJDK25U-jdk_x64_alpine-linux_hotspot_25.0.5_8.tar.gz.sig"
+    },
+    {
+      "name": "OpenJDK25U-jdk_x64_linux_hotspot_25.0.5_8.tar.gz",
+      "size": 141341188,
+      "digest": "sha256:68982529869257d0ee6b824ec5aa270ff8b118bb438670da0b97ebdab178d7fb",
+      "content_type": "application/gzip",
+      "browser_download_url": "https://github.com/adoptium/temurin25-binaries/releases/download/jdk-25.0.5%2B8/OpenJDK25U-jdk_x64_linux_hotspot_25.0.5_8.tar.gz"
+    },
+    {
+      "name": "OpenJDK25U-jdk_x64_linux_hotspot_25.0.5_8.tar.gz.json",
+      "size": 32141,
+      "digest": "sha256:056e4f94b72d6677a9ebe21781b4d57d7aac7718934a1bde953a1f143b597cc1",
+      "content_type": "application/json",
+      "browser_download_url": "https://github.com/adoptium/temurin25-binaries/releases/download/jdk-25.0.5%2B8/OpenJDK25U-jdk_x64_linux_hotspot_25.0.5_8.tar.gz.json"
+    },
+    {
+      "name": "OpenJDK25U-jdk_x64_linux_hotspot_25.0.5_8.tar.gz.sha256.txt",
+      "size": 115,
+      "digest": "sha256:2df2e8397f2e83a3fd82ad7caa45f5c979a541e497b43c27b2c7118b3a73735f",
+      "content_type": "text/plain",
+      "browser_download_url": "https://github.com/adoptium/temurin25-binaries/releases/download/jdk-25.0.5%2B8/OpenJDK25U-jdk_x64_linux_hotspot_25.0.5_8.tar.gz.sha256.txt"
+    },
+    {
+      "name": "OpenJDK25U-jdk_x64_linux_hotspot_25.0.5_8.tar.gz.sig",
+      "size": 310,
+      "digest": "sha256:858b1b75763bf99fa11011553482b6e46819dd9020d9aefd076c1079f2f1eb69",
+      "content_type": "application/pgp-signature",
+      "browser_download_url": "https://github.com/adoptium/temurin25-binaries/releases/download/jdk-25.0.5%2B8/OpenJDK25U-jdk_x64_linux_hotspot_25.0.5_8.tar.gz.sig"
+    },
+    {
+      "name": "OpenJDK25U-jre_aarch64_alpine-linux_hotspot_25.0.5_8.tar.gz",
+      "size": 59746005,
+      "digest": "sha256:7c2b97b1b34947399f6c911e5aa69d171b745b0005ea79f47c4f3f1d47554bc2",
+      "content_type": "application/gzip",
+      "browser_download_url": "https://github.com/adoptium/temurin25-binaries/releases/download/jdk-25.0.5%2B8/OpenJDK25U-jre_aarch64_alpine-linux_hotspot_25.0.5_8.tar.gz"
+    },
+    {
+      "name": "OpenJDK25U-jre_aarch64_alpine-linux_hotspot_25.0.5_8.tar.gz.json",
+      "size": 31267,
+      "digest": "sha256:5bd1498d882a865c967b40315d04080f66f25fac57354220696734565b75e61e",
+      "content_type": "application/json",
+      "browser_download_url": "https://github.com/adoptium/temurin25-binaries/releases/download/jdk-25.0.5%2B8/OpenJDK25U-jre_aarch64_alpine-linux_hotspot_25.0.5_8.tar.gz.json"
+    },
+    {
+      "name": "OpenJDK25U-jre_aarch64_alpine-linux_hotspot_25.0.5_8.tar.gz.sha256.txt",
+      "size": 126,
+      "digest": "sha256:423ebe4faf81347228eb6ee2d61e35f14ce3898e6afdb97698a136c506c0351e",
+      "content_type": "text/plain",
+      "browser_download_url": "https://github.com/adoptium/temurin25-binaries/releases/download/jdk-25.0.5%2B8/OpenJDK25U-jre_aarch64_alpine-linux_hotspot_25.0.5_8.tar.gz.sha256.txt"
+    },
+    {
+      "name": "OpenJDK25U-jre_aarch64_alpine-linux_hotspot_25.0.5_8.tar.gz.sig",
+      "size": 310,
+      "digest": "sha256:8e9112463729e12dfd37195ade01dad9dd2f614708bcbc9aab0ed8ef02b2b792",
+      "content_type": "application/pgp-signature",
+      "browser_download_url": "https://github.com/adoptium/temurin25-binaries/releases/download/jdk-25.0.5%2B8/OpenJDK25U-jre_aarch64_alpine-linux_hotspot_25.0.5_8.tar.gz.sig"
+    },
+    {
+      "name": "OpenJDK25U-jre_aarch64_linux_hotspot_25.0.5_8.tar.gz",
+      "size": 60517419,
+      "digest": "sha256:963931723891302ebb2687178532c3d793d71e2577cd058061c7efb396140a86",
+      "content_type": "application/gzip",
+      "browser_download_url": "https://github.com/adoptium/temurin25-binaries/releases/download/jdk-25.0.5%2B8/OpenJDK25U-jre_aarch64_linux_hotspot_25.0.5_8.tar.gz"
+    },
+    {
+      "name": "OpenJDK25U-jre_aarch64_linux_hotspot_25.0.5_8.tar.gz.json",
+      "size": 32566,
+      "digest": "sha256:5fe506199dceaffbaa1d686e384a5ec7f7baeaee64c1f28f59ce7d2ccbf0e323",
+      "content_type": "application/json",
+      "browser_download_url": "https://github.com/adoptium/temurin25-binaries/releases/download/jdk-25.0.5%2B8/OpenJDK25U-jre_aarch64_linux_hotspot_25.0.5_8.tar.gz.json"
+    },
+    {
+      "name": "OpenJDK25U-jre_aarch64_linux_hotspot_25.0.5_8.tar.gz.sha256.txt",
+      "size": 119,
+      "digest": "sha256:86029d752f5345361dc23f51a92942e5de5a86c015beb70bc858011bc96a305d",
+      "content_type": "text/plain",
+      "browser_download_url": "https://github.com/adoptium/temurin25-binaries/releases/download/jdk-25.0.5%2B8/OpenJDK25U-jre_aarch64_linux_hotspot_25.0.5_8.tar.gz.sha256.txt"
+    },
+    {
+      "name": "OpenJDK25U-jre_aarch64_linux_hotspot_25.0.5_8.tar.gz.sig",
+      "size": 310,
+      "digest": "sha256:a2b622405db790527ee012717647db7dd06c5c2cd70e387b055067ccd3f6cc73",
+      "content_type": "application/pgp-signature",
+      "browser_download_url": "https://github.com/adoptium/temurin25-binaries/releases/download/jdk-25.0.5%2B8/OpenJDK25U-jre_aarch64_linux_hotspot_25.0.5_8.tar.gz.sig"
+    },
+    {
+      "name": "OpenJDK25U-jre_x64_alpine-linux_hotspot_25.0.5_8.tar.gz",
+      "size": 60929664,
+      "digest": "sha256:b46e981318decb77eda728e006c7678a1ac0c56cf81ae3ad245710c2e4fa1a55",
+      "content_type": "application/gzip",
+      "browser_download_url": "https://github.com/adoptium/temurin25-binaries/releases/download/jdk-25.0.5%2B8/OpenJDK25U-jre_x64_alpine-linux_hotspot_25.0.5_8.tar.gz"
+    },
+    {
+      "name": "OpenJDK25U-jre_x64_alpine-linux_hotspot_25.0.5_8.tar.gz.json",
+      "size": 30760,
+      "digest": "sha256:a53f8507ea9842dd16285bae08936215092e22501d87646112a2aabb933dfb97",
+      "content_type": "application/json",
+      "browser_download_url": "https://github.com/adoptium/temurin25-binaries/releases/download/jdk-25.0.5%2B8/OpenJDK25U-jre_x64_alpine-linux_hotspot_25.0.5_8.tar.gz.json"
+    },
+    {
+      "name": "OpenJDK25U-jre_x64_alpine-linux_hotspot_25.0.5_8.tar.gz.sha256.txt",
+      "size": 122,
+      "digest": "sha256:29c00b0a23048b3f9cb120ef0435a11e891e9a556eac76b89a31ea59e883faa8",
+      "content_type": "text/plain",
+      "browser_download_url": "https://github.com/adoptium/temurin25-binaries/releases/download/jdk-25.0.5%2B8/OpenJDK25U-jre_x64_alpine-linux_hotspot_25.0.5_8.tar.gz.sha256.txt"
+    },
+    {
+      "name": "OpenJDK25U-jre_x64_alpine-linux_hotspot_25.0.5_8.tar.gz.sig",
+      "size": 310,
+      "digest": "sha256:ff901faeb6063fd9144d96077a7ab6c239f43414bffe2323d308c1f34f0f21e9",
+      "content_type": "application/pgp-signature",
+      "browser_download_url": "https://github.com/adoptium/temurin25-binaries/releases/download/jdk-25.0.5%2B8/OpenJDK25U-jre_x64_alpine-linux_hotspot_25.0.5_8.tar.gz.sig"
+    },
+    {
+      "name": "OpenJDK25U-jre_x64_linux_hotspot_25.0.5_8.tar.gz",
+      "size": 61736206,
+      "digest": "sha256:6fac98f0c8202efc3135a9e9e42aa61963ec42d1c5cbb40caf231e7b14a24ef6",
+      "content_type": "application/gzip",
+      "browser_download_url": "https://github.com/adoptium/temurin25-binaries/releases/download/jdk-25.0.5%2B8/OpenJDK25U-jre_x64_linux_hotspot_25.0.5_8.tar.gz"
+    },
+    {
+      "name": "OpenJDK25U-jre_x64_linux_hotspot_25.0.5_8.tar.gz.json",
+      "size": 32141,
+      "digest": "sha256:325b84886d3042d186b25bbb5dec573cb64382db87aa101bd62e9651d8d20d0d",
+      "content_type": "application/json",
+      "browser_download_url": "https://github.com/adoptium/temurin25-binaries/releases/download/jdk-25.0.5%2B8/OpenJDK25U-jre_x64_linux_hotspot_25.0.5_8.tar.gz.json"
+    },
+    {
+      "name": "OpenJDK25U-jre_x64_linux_hotspot_25.0.5_8.tar.gz.sha256.txt",
+      "size": 115,
+      "digest": "sha256:d4fbab8aca7aa28755ea0a0bf1c3484d20afd0d2659e1cb70f40679891c8c6b6",
+      "content_type": "text/plain",
+      "browser_download_url": "https://github.com/adoptium/temurin25-binaries/releases/download/jdk-25.0.5%2B8/OpenJDK25U-jre_x64_linux_hotspot_25.0.5_8.tar.gz.sha256.txt"
+    },
+    {
+      "name": "OpenJDK25U-jre_x64_linux_hotspot_25.0.5_8.tar.gz.sig",
+      "size": 310,
+      "digest": "sha256:5a05cd892795b092c45bc89d672529cc0d22b5890c7f680b09aa9693f5b1a8b0",
+      "content_type": "application/pgp-signature",
+      "browser_download_url": "https://github.com/adoptium/temurin25-binaries/releases/download/jdk-25.0.5%2B8/OpenJDK25U-jre_x64_linux_hotspot_25.0.5_8.tar.gz.sig"
+    }
+  ]
+}

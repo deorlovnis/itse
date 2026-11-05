@@ -1,0 +1,21 @@
+{
+  "namespace": "JetBrains",
+  "name": "kotlin-server",
+  "version": "0.0.86",
+  "targetPlatform": "linux-arm64",
+  "timestamp": "2026-11-04T09:57:36.057595Z",
+  "preRelease": false,
+  "displayName": "Kotlin by JetBrains",
+  "license": "SEE LICENSE IN LICENSE.txt",
+  "files": {
+    "download": "https://open-vsx.org/api/JetBrains/kotlin-server/linux-arm64/0.0.86/file/JetBrains.kotlin-server-0.0.86@linux-arm64.vsix",
+    "signature": "https://open-vsx.org/api/JetBrains/kotlin-server/linux-arm64/0.0.86/file/JetBrains.kotlin-server-0.0.86@linux-arm64.sigzip",
+    "manifest": "https://open-vsx.org/api/JetBrains/kotlin-server/linux-arm64/0.0.86/file/package.json",
+    "readme": "https://open-vsx.org/api/JetBrains/kotlin-server/linux-arm64/0.0.86/file/readme.md",
+    "license": "https://open-vsx.org/api/JetBrains/kotlin-server/linux-arm64/0.0.86/file/LICENSE.txt",
+    "icon": "https://open-vsx.org/api/JetBrains/kotlin-server/linux-arm64/0.0.86/file/kotlin.png",
+    "vsixmanifest": "https://open-vsx.org/api/JetBrains/kotlin-server/linux-arm64/0.0.86/file/extension.vsixmanifest",
+    "sha256": "https://open-vsx.org/api/JetBrains/kotlin-server/linux-arm64/0.0.86/file/JetBrains.kotlin-server-0.0.86@linux-arm64.sha256",
+    "publicKey": "https://open-vsx.org/api/-/public-key/14ccb407-4e79-41ed-be5a-6d608325c45a"
+  }
+}

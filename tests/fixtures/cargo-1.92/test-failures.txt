@@ -1,0 +1,51 @@
+   Compiling rust-ws v0.1.0 (/work/rust-ws)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.19s
+     Running unittests src/lib.rs (target/debug/deps/rust_ws-e8ef7dc6bf9b207c)
+
+running 2 tests
+test tests::adds_two_numbers ... ok
+test tests::saves_every_line ... FAILED
+
+failures:
+
+---- tests::saves_every_line stdout ----
+
+thread 'tests::saves_every_line' (51984) panicked at src/lib.rs:25:9:
+assertion `left == right` failed
+  left: 2
+ right: 3
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    tests::saves_every_line
+
+test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `--lib`
+     Running tests/orders.rs (target/debug/deps/orders-cd1d9b52ebfc127a)
+
+running 3 tests
+test integration_saves_to_a_database ... ignored, needs a database
+test integration_adds ... ok
+test integration_rejects_an_empty_order ... FAILED
+
+failures:
+
+---- integration_rejects_an_empty_order stdout ----
+
+thread 'integration_rejects_an_empty_order' (51987) panicked at tests/orders.rs:11:5:
+an order needs lines
+second line of the message
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    integration_rejects_an_empty_order
+
+test result: FAILED. 1 passed; 1 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `--test orders`
+error: 2 targets failed:
+    `--lib`
+    `--test orders`

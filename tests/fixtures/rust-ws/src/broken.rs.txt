@@ -1,0 +1,7 @@
+//! The compile-error variant of src/lib.rs, swapped in by the tests.
+
+/// The sum of two numbers.
+pub fn add(a: u32, b: u32) -> u32 {
+    let unused = 1;
+    a + "b"
+}

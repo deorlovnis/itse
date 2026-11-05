@@ -1,0 +1,45 @@
+[package]
+name = "itse"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.92"
+description = "A small workbench for coding agents and their harnesses"
+publish = false
+default-run = "itse"
+# tests/fixture/ is a binary, not a test; the tests are listed below.
+autotests = false
+exclude = ["bench/", "tests/fixtures/"]
+
+[[bin]]
+name = "itse"
+path = "src/main.rs"
+
+# Test-only fake servers and delegates; never installed (`cargo install --path . --bin itse`).
+[[bin]]
+name = "itse-fixture"
+path = "tests/fixture/main.rs"
+test = false
+
+[[test]]
+name = "e2e"
+path = "tests/e2e.rs"
+
+[dependencies]
+anyhow = "1.0.104"
+lexopt = "0.3.2"
+regex-lite = "0.1.9"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+sha2 = "0.11.1"
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+# Every unsafe block carries a // SAFETY: note, as in Halti.
+undocumented_unsafe_blocks = "deny"
+
+[profile.release]
+lto = true
+strip = true
+codegen-units = 1
