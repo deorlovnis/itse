@@ -1,7 +1,7 @@
 //! The session host: the daemon's shared state (`Host`), its registry of
 //! server slots and live runs, `procs.json`, how children are spawned (own process group, rlimits,
-//! OOM score), the start of a protocol server that the LSP and MCP clients share, what a crash
-//! leaves, and the clean-up after a daemon restart.
+//! OOM score), the start of a language server, what a crash leaves, and the clean-up after a
+//! daemon restart.
 //!
 //! A slot has two parts, so `status` never hangs on a start: `phase`, behind a Mutex and a Condvar,
 //! which one caller moves to `Starting` and then starts the server with no lock held while the
@@ -22,8 +22,8 @@ use serde_json::{Value, json};
 
 use crate::actions::{self, Run};
 use crate::resolve::Resolved;
-use crate::rpc::{Cancel, Dialect, Framing, Handler, Peer};
-use crate::{lsp, manifest::Config, manifest::DapVia, results::State, sys, sys::lock, usage::Usage, workspace::Dirs, workspace::Workspace};
+use crate::rpc::{Cancel, Framing, Handler, Peer};
+use crate::{lsp, manifest::Config, results::State, sys, sys::lock, usage::Usage, workspace::Dirs, workspace::Workspace};
 
 /// The env var each server is started with, set to a value of its own, which its children inherit:
 /// rust-analyzer starts `cargo check` in a session of its own, out of reach of the server's group.
@@ -55,12 +55,10 @@ pub struct Host {
     /// stopping daemon never re-binds.
     pub bound: Mutex<u64>,
     pub usage: Usage,
-    /// `lsp:<id>` and `mcp:<id>` → their slot; a handle names the same server across restarts.
+    /// `lsp:<id>` → its slot; a handle names the same server across restarts.
     pub slots: Mutex<BTreeMap<String, Arc<Slot>>>,
     /// `run:N` → the runs that haven't ended, started here or re-adopted.
     pub runs: Mutex<BTreeMap<String, Arc<Run>>>,
-    /// `dbg:N` → its debug session, until it is stopped, reaped or found gone.
-    pub debug: Mutex<BTreeMap<String, Arc<crate::dap::Session>>>,
     /// What `procs.json` holds: one record per live child, rewritten on every change.
     procs: Mutex<Vec<Value>>,
     /// The idle stops under way, each on a thread of its own: the daemon waits for them as it exits.
@@ -76,9 +74,8 @@ impl Host {
         let started_by = env::var("ITSE_STARTED_BY").ok().filter(|b| b == "mcp").unwrap_or_else(|| "cli".into());
         let (conns, last, stopping, bound) = (AtomicUsize::new(0), Mutex::new(Instant::now()), AtomicBool::new(false), Mutex::new(0));
         let (usage, sessions, base_env) = (Usage::new(&dirs, &ws.root, true), AtomicUsize::new(0), base_env(env::vars_os()));
-        let (slots, runs, debug, procs, stops, started, idle) =
-            (Mutex::default(), Mutex::default(), Mutex::default(), Mutex::default(), Mutex::default(), SystemTime::now(), Duration::from_secs(idle));
-        Self { ws, dirs, socket, started, started_by, exe, base_env, idle, conns, sessions, last, stopping, bound, usage, slots, runs, debug, procs, stops }
+        let (slots, runs, procs, stops, started, idle) = (Mutex::default(), Mutex::default(), Mutex::default(), Mutex::default(), SystemTime::now(), Duration::from_secs(idle));
+        Self { ws, dirs, socket, started, started_by, exe, base_env, idle, conns, sessions, last, stopping, bound, usage, slots, runs, procs, stops }
     }
 
     /// A handle's slot, made `Stopped` on first use.
@@ -99,29 +96,11 @@ impl Host {
         self.retrack(|p| p["handle"] != handle || p["pid"] != pid, None);
     }
 
-    /// Spawn `argv` as `l` runs it (its cwd, its env on top of `env`, its limits), marked with
-    /// `marker`, in its own group, stderr (and, unless `pipe`, stdout) appended to `log`; in
-    /// `procs.json` as `handle` of `kind` from the spawn on. The log file is returned too.
-    #[allow(clippy::too_many_arguments)]
-    pub fn spawn_as(&self, handle: &str, kind: &str, l: &Launch, argv: &[String], env: &BTreeMap<String, String>, log: &Path, marker: &str, pipe: bool) -> Result<(Child, File)> {
-        let (program, args) = argv.split_first().ok_or_else(|| anyhow!("{} has no command", l.id))?;
-        let file = fs::OpenOptions::new().create(true).append(true).mode(0o600).open(log)?;
-        let (input, output) = if pipe { (Stdio::piped(), Stdio::piped()) } else { (Stdio::null(), Stdio::from(file.try_clone()?)) };
-        let mut cmd = Command::new(program);
-        cmd.args(args).current_dir(&l.cwd).env_clear().envs(env).envs(l.env.iter().cloned()).env(MARKER, marker).stdin(input).stdout(output).stderr(file.try_clone()?);
-        let child = spawn(&mut cmd, &l.limits, false, 800).map_err(|e| anyhow!("starting {program}: {e}"))?;
-        let (pid, at) = (child.id() as i32, sys::utc(SystemTime::now()));
-        let start_time = sys::proc_stat(pid).map_or(0, |s| s.start_time);
-        let record = json!({"handle": handle, "kind": kind, "pid": pid, "pgid": pid, "start_time": start_time, "argv0": program, "started_at": at, "log": log, "marker": marker});
-        self.track(handle, Some(record));
-        Ok((child, file))
-    }
-
-    /// `<kind>:<id>` up for a call, started on demand by the first caller while the others wait for
+    /// `lsp:<id>` up for a call, started on demand by the first caller while the others wait for
     /// it, unless `start` is false: then None if it isn't up. One found ended leaves `procs.json`
-    /// here. `begin` starts it, as `start_server` with the kind's handshake.
-    pub fn ask(&self, kind: &str, l: &Launch, start: bool, cancel: &Cancel, begin: impl FnOnce(&Slot) -> Result<Server>) -> Result<Option<Asked>> {
-        let handle = format!("{kind}:{}", l.id);
+    /// here. `begin` starts it, as `start_server` with the handshake.
+    pub fn ask(&self, l: &Launch, start: bool, cancel: &Cancel, begin: impl FnOnce(&Slot) -> Result<Server>) -> Result<Option<Asked>> {
+        let handle = format!("lsp:{}", l.id);
         let slot = self.slot(&handle);
         let (up, ended) = slot.get();
         ended.inspect(|&pid| self.untrack(&handle, pid));
@@ -130,43 +109,48 @@ impl Host {
             None if !start => return Ok(None),
             None => slot.up(|| begin(&slot), cancel)?,
         };
-        let notes = note.map(|n| format!("{} {n}", l.id)).into_iter().chain(changed(kind, &server, l)).collect();
+        let notes = note.map(|n| format!("{} {n}", l.id)).into_iter().chain(changed(&server, l)).collect();
         Ok(Some(Asked { handle, slot, server, notes, fresh }))
     }
 
-    /// Spawn a server of `kind` in its own group, stderr to `servers/<id>.log` (the last start's
+    /// Spawn a language server in its own group, stderr to `servers/<id>.log` (the last start's
     /// kept as `<id>.log.1`, so a crash's tail is this start's; the daemon starts it afresh past
     /// 4 MB), make its peer with the reader `handler` gives for this start's epoch and the log, and
-    /// run `init`, the kind's handshake. It is in `procs.json` from the spawn on, with the
+    /// run `init`, the handshake. It is in `procs.json` from the spawn on, with the
     /// `ITSE_SERVER` marker its env passes down to what it starts, so a daemon that dies during a
     /// long handshake leaves nothing behind; the marker is the one `ITSE_*` var a server gets. A
     /// server that ends or fails before the handshake is done has its group and its marked
     /// processes killed, and says how, with its log's last line.
-    #[allow(clippy::too_many_arguments)]
     pub fn start_server(
         &self,
         slot: &Slot,
-        kind: &str,
         l: &Launch,
         env: &BTreeMap<String, String>,
-        framing: Framing,
-        dialect: Dialect,
         handler: impl FnOnce(u64, File) -> Arc<dyn Handler>,
         init: impl FnOnce(&Server) -> Result<()>,
     ) -> Result<Server> {
         // Before the log turns over, so a server that can't start leaves the last real logs as they were.
         ensure!(!l.argv.is_empty(), "{} has no command", l.id);
-        let (dir, handle) = (self.ws.state_dir(&self.dirs).join("servers"), format!("{kind}:{}", l.id));
+        let (dir, handle) = (self.ws.state_dir(&self.dirs).join("servers"), format!("lsp:{}", l.id));
         sys::private_dir(&dir)?;
         let log = dir.join(format!("{}.log", l.id));
         let _ = fs::rename(&log, dir.join(format!("{}.log.1", l.id)));
         let marker = format!("{}-{}", std::process::id(), sys::hex(&sys::random_bytes::<8>()?));
-        let (mut child, file) = self.spawn_as(&handle, kind, l, &l.argv, env, &log, &marker, true)?;
+        let (program, args) = l.argv.split_first().ok_or_else(|| anyhow!("{} has no command", l.id))?;
+        let file = fs::OpenOptions::new().create(true).append(true).mode(0o600).open(&log)?;
+        let mut cmd = Command::new(program);
+        cmd.args(args).current_dir(&l.cwd).env_clear().envs(env).envs(l.env.iter().cloned()).env(MARKER, &marker);
+        cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(file.try_clone()?);
+        let mut child = spawn(&mut cmd, &l.limits, false, 800).map_err(|e| anyhow!("starting {program}: {e}"))?;
+        let (pid, at) = (child.id() as i32, sys::utc(SystemTime::now()));
+        let start_time = sys::proc_stat(pid).map_or(0, |s| s.start_time);
+        let record = json!({"handle": handle, "kind": "lsp", "pid": pid, "pgid": pid, "start_time": start_time, "argv0": program, "started_at": at, "log": log, "marker": marker});
+        self.track(&handle, Some(record));
         // Only the one start under way changes the epoch.
         let epoch = lock(&slot.live).epoch + 1;
         *lock(&slot.live) = Live { epoch, ..Live::default() };
         let (Some(stdout), Some(stdin)) = (child.stdout.take(), child.stdin.take()) else { bail!("{} has no stdio", l.id) };
-        let peer = Peer::start(io::BufReader::new(stdout), stdin, framing, dialect, handler(epoch, file));
+        let peer = Peer::start(io::BufReader::new(stdout), stdin, Framing::Headers, handler(epoch, file));
         let secs = env::var("ITSE_SERVER_IDLE_S").ok().and_then(|s| s.parse().ok());
         let idle = Duration::from_secs(secs.unwrap_or_else(|| l.idle_minutes.or(self.config().server_idle_minutes).unwrap_or(30) * 60));
         let server = Server { peer, child: Mutex::new(child), exit_codes: l.exit_codes.clone(), log, idle, hash: launch_hash(l), marker, epoch };
@@ -178,18 +162,18 @@ impl Host {
         Ok(server)
     }
 
-    /// The `status` row of `<kind>:<id>`, read without waiting on a start: `starting (41 s)`, `up`
+    /// The `status` row of `lsp:<id>`, read without waiting on a start: `starting (41 s)`, `up`
     /// with what `summary` makes of its live state, `crashed` with how, `gone` after a daemon
     /// restart, or `stopped`.
-    pub fn row(&self, kind: &str, l: &Launch, summary: impl FnOnce(&Live) -> Vec<String>) -> State {
-        let handle = format!("{kind}:{}", l.id);
+    pub fn row(&self, l: &Launch, summary: impl FnOnce(&Live) -> Vec<String>) -> State {
+        let handle = format!("lsp:{}", l.id);
         let slot = lock(&self.slots).get(&handle).cloned().unwrap_or_default();
         let (state, reason) = match slot.phase.try_lock().as_deref() {
             Ok(Phase::Starting(at)) => (format!("starting ({} s)", at.elapsed().as_secs()), String::new()),
             Ok(Phase::Up(s)) => {
                 let live = lock(&slot.live);
                 let pid = s.child.try_lock().map(|c| format!("pid {}", c.id()));
-                let parts: Vec<String> = pid.into_iter().chain(summary(&live)).chain(changed(kind, s, l)).chain(live.last.back().cloned()).collect();
+                let parts: Vec<String> = pid.into_iter().chain(summary(&live)).chain(changed(s, l)).chain(live.last.back().cloned()).collect();
                 ("up".into(), parts.join("; "))
             }
             Ok(Phase::Crashed(c)) => {
@@ -203,7 +187,7 @@ impl Host {
     }
 
     /// Kill `child`'s group and what carries `marker`, drop it from `procs.json`, and reap it.
-    pub fn kill_child(&self, handle: &str, child: &mut Child, marker: &str) -> io::Result<ExitStatus> {
+    fn kill_child(&self, handle: &str, child: &mut Child, marker: &str) -> io::Result<ExitStatus> {
         let pid = child.id() as i32;
         kill_tree(pid, marker, || drop(child.try_wait()));
         self.untrack(handle, pid);
@@ -219,7 +203,7 @@ impl Host {
     }
 
     /// After a daemon restart, from the old `procs.json`: runs are re-adopted (or their end written);
-    /// servers and adapters lost their pipes, so what is left of their groups is killed and their
+    /// servers lost their pipes, so what is left of their groups is killed and their
     /// handles say `gone: daemon restarted`. A pid counts only with its recorded start time and not as
     /// a zombie; with the leader gone, the group's leftover members still go, since Linux reuses no
     /// pid that is still a group id.
@@ -279,16 +263,16 @@ impl Host {
         if session { &self.sessions } else { &self.conns }
     }
 
-    /// An attached MCP session, a live run or a live debug session keeps a replaced binary's daemon serving.
+    /// An attached MCP session or a live run keeps a replaced binary's daemon serving.
     pub fn busy(&self) -> bool {
-        self.sessions.load(Ordering::SeqCst) > 0 || !lock(&self.runs).is_empty() || !lock(&self.debug).is_empty()
+        self.sessions.load(Ordering::SeqCst) > 0 || !lock(&self.runs).is_empty()
     }
 
-    /// No connection, no live run or debug session and no server up, starting or stopping for the idle time.
+    /// No connection, no live run and no server up, starting or stopping for the idle time.
     pub fn idle(&self) -> bool {
         let stopping = || lock(&self.stops).iter().any(|t| !t.is_finished());
         let serving = || stopping() || lock(&self.slots).values().any(|s| !matches!(s.phase.try_lock().as_deref(), Ok(Phase::Stopped | Phase::Crashed(_) | Phase::Gone(_))));
-        self.conns.load(Ordering::SeqCst) == 0 && lock(&self.runs).is_empty() && lock(&self.debug).is_empty() && lock(&self.last).elapsed() >= self.idle && !serving()
+        self.conns.load(Ordering::SeqCst) == 0 && lock(&self.runs).is_empty() && lock(&self.last).elapsed() >= self.idle && !serving()
     }
 
     /// Stop a server and drop it from `procs.json`; false if it wasn't up.
@@ -302,9 +286,7 @@ impl Host {
     /// slot's lock, so no query gets it meanwhile, and stopped on a thread of its own, since a stop
     /// waits on the server. Nothing is restarted here: the next call that needs a server starts it.
     /// A server log past 4 MB starts afresh: a chatty server (or a `RA_LOG` passed down) fills no disk.
-    /// Debug sessions are reaped too.
     pub fn reap(self: &Arc<Self>) {
-        crate::dap::reap(self);
         let slots: Vec<(String, Arc<Slot>)> = lock(&self.slots).iter().map(|(h, s)| (h.clone(), s.clone())).collect();
         for (handle, slot) in slots {
             let Ok(mut phase) = slot.phase.try_lock() else { continue };
@@ -329,15 +311,12 @@ impl Host {
         }
     }
 
-    /// Stop every server and end every debug session at once, as the daemon exits; each gets `wait`
-    /// for its goodbye (a session's `disconnect` its own 3 s), and an idle stop under way gets to
-    /// finish its own. A server still starting is in `procs.json` from its spawn on, and its group
-    /// and marked processes are killed from there.
+    /// Stop every server at once, as the daemon exits; each gets `wait` for its goodbye, and an idle
+    /// stop under way gets to finish its own. A server still starting is in `procs.json` from its
+    /// spawn on, and its group and marked processes are killed from there.
     pub fn stop_servers(self: &Arc<Self>, wait: Duration) {
         let handles: Vec<String> = lock(&self.slots).keys().cloned().collect();
-        let mut stops: Vec<_> = handles.into_iter().map(|h| (self.clone(), h)).map(|(host, h)| thread::spawn(move || _ = host.stop_server(&h, wait))).collect();
-        let debug: Vec<_> = lock(&self.debug).values().cloned().collect();
-        stops.extend(debug.into_iter().map(|s| (self.clone(), s)).map(|(host, s)| thread::spawn(move || s.end(&host, "is gone: the daemon stopped"))));
+        let stops: Vec<_> = handles.into_iter().map(|h| (self.clone(), h)).map(|(host, h)| thread::spawn(move || _ = host.stop_server(&h, wait))).collect();
         let idle: Vec<_> = mem::take(&mut *lock(&self.stops));
         stops.into_iter().chain(idle).for_each(|t| drop(t.join()));
         let left: Vec<Value> = lock(&self.procs).iter().filter(|p| p["kind"] != "run" && p["pgid"].is_i64()).cloned().collect();
@@ -356,16 +335,14 @@ pub struct Asked {
     pub fresh: bool,
 }
 
-/// The launch's hash, as `Server::hash`. What only chooses the tools listed (`expose`, `tools`,
-/// `max_list_bytes`) needs no restart, so it is left out.
+/// The launch's hash, as `Server::hash`.
 pub fn launch_hash(l: &Launch) -> String {
-    let l = Launch { expose: false, tools: None, max_list_bytes: None, ..l.clone() };
     sys::sha256_hex(format!("{l:?}").as_bytes())[..12].to_string()
 }
 
 /// A server left running from a launch that has changed since.
-fn changed(kind: &str, s: &Server, l: &Launch) -> Option<String> {
-    (s.hash != launch_hash(l)).then(|| format!("config changed; 'itse stop {kind}:{}' to apply", l.id))
+fn changed(s: &Server, l: &Launch) -> Option<String> {
+    (s.hash != launch_hash(l)).then(|| format!("config changed; 'itse stop lsp:{}' to apply", l.id))
 }
 
 /// The daemon's env minus `ITSE_*`, `CLAUDE_*` and `AI_AGENT`, which name its starter, not a server's.
@@ -393,20 +370,33 @@ impl Drop for Count {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Serialize)]
-#[serde(rename_all = "lowercase")]
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq)]
 pub enum Protocol {
     #[default]
+    #[serde(rename = "lsp")]
     Lsp,
+    /// `dap` and `mcp`: protocols itse no longer hosts. Such a server still loads, and never starts.
+    #[serde(rename = "dap")]
     Dap,
+    #[serde(rename = "mcp")]
     Mcp,
+}
+
+impl Protocol {
+    /// A retired protocol's name.
+    pub fn retired(self) -> Option<&'static str> {
+        match self {
+            Protocol::Lsp => None,
+            Protocol::Dap => Some("dap"),
+            Protocol::Mcp => Some("mcp"),
+        }
+    }
 }
 
 /// A resolved server: argv and env rendered, ready to spawn.
 #[derive(Clone, Debug, Default)]
 pub struct Launch {
     pub id: String,
-    pub protocol: Protocol,
     pub argv: Vec<String>,
     pub cwd: PathBuf,
     pub env: Vec<(String, String)>,
@@ -421,14 +411,6 @@ pub struct Launch {
     /// What it writes into the workspace itself, as declared.
     pub outputs: Vec<String>,
     pub idle_minutes: Option<u64>,
-    /// How long an MCP server's tool call may take; 120 s when unset.
-    pub timeout_s: Option<u64>,
-    /// An MCP server whose tools the developer layer lists in itse's own, with its allowlist and
-    /// its share of the list's bytes.
-    pub expose: bool,
-    pub tools: Option<Vec<String>>,
-    pub max_list_bytes: Option<usize>,
-    pub via: Option<DapVia>,
 }
 
 /// rlimits set in `pre_exec` when declared (RLIMIT_CORE is always 0), and the OOM score written
@@ -522,15 +504,13 @@ pub struct Live {
     pub lsp: lsp::Seen,
     /// When a call last used the server, for the idle stop.
     pub used: Instant,
-    /// An MCP server said its tool list changed: the next listing asks it again.
-    pub tools_changed: bool,
     /// Counts the starts, so the reader of an earlier one records nothing here.
     pub epoch: u64,
 }
 
 impl Default for Live {
     fn default() -> Self {
-        Self { last: VecDeque::new(), lsp: lsp::Seen::default(), used: Instant::now(), tools_changed: false, epoch: 0 }
+        Self { last: VecDeque::new(), lsp: lsp::Seen::default(), used: Instant::now(), epoch: 0 }
     }
 }
 
@@ -634,10 +614,8 @@ impl Slot {
 }
 
 impl Server {
-    /// The protocol's goodbye (LSP `shutdown`, waiting up to `wait`, and `exit`; an MCP server's
-    /// stdin closed), up to 2 s for the
-    /// process to go, and its group and marked processes are killed; its pid. Writes never block, so
-    /// neither does this.
+    /// LSP `shutdown`, waiting up to `wait`, and `exit`, up to 2 s for the process to go, and its
+    /// group and marked processes are killed; its pid. Writes never block, so neither does this.
     pub fn stop(&self, wait: Duration) -> i32 {
         if self.peer.bye(wait) {
             sys::wait_until(wait.min(Duration::from_secs(2)), || !lock(&self.child).try_wait().is_ok_and(|st| st.is_none()));
@@ -670,22 +648,22 @@ impl Crash {
     }
 }
 
-/// `next.json`: handle counters, never reused, so `run:14` names one run forever.
+/// `next.json`: handle counters, never reused, so `run:14` names one run forever. Other keys (the
+/// debug sessions' old `dbg`) are dropped at the next write.
 #[derive(Debug, Default, Deserialize, PartialEq, Serialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub struct Next {
     pub run: u64,
-    pub dbg: u64,
     pub q: u64,
 }
 
 impl Next {
-    /// The next number of a handle kind (`run`, `dbg`, `q`) in `<ws state>/next.json`, as `kind:N`.
+    /// The next number of a handle kind (`run`, `q`) in `<ws state>/next.json`, as `kind:N`.
     pub fn take(state: &Path, kind: &str) -> anyhow::Result<String> {
         static HELD: Mutex<()> = Mutex::new(());
         let (_held, path) = (lock(&HELD), state.join("next.json"));
         let mut next: Next = fs::read(&path).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
-        let n = [("run", &mut next.run), ("dbg", &mut next.dbg)].into_iter().find(|(k, _)| *k == kind).map_or(&mut next.q, |(_, n)| n);
+        let n = if kind == "run" { &mut next.run } else { &mut next.q };
         *n += 1;
         let taken = format!("{kind}:{n}");
         sys::write_atomic(&path, &serde_json::to_vec(&next)?)?;

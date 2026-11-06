@@ -35,13 +35,6 @@
       "languages": { "kt": "kotlin", "kts": "kotlin" },
       "env": { "JAVA_HOME": "${pkg:jdk}" },
       "init_options": { "defaultSdk": "${pkg:jdk}", "buildTools": ["gradle"] }
-    },
-    {
-      "id": "kotlin-dap",
-      "protocol": "dap",
-      "adapter_id": "intellij_debugger",
-      "via": { "lsp_command": { "server": "kotlin-lsp", "command": "start_debug_server" } },
-      "hide_vars": ["^\\$i\\$a\\$"]
     }
   ],
   "problemMatchers": {

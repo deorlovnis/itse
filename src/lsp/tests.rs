@@ -4,7 +4,7 @@ use std::process::{Command, Stdio};
 use std::thread;
 
 use super::*;
-use crate::rpc::{self, MAX_FRAME};
+use crate::rpc::{self, Framing, MAX_FRAME};
 use crate::sys::tests::TempDir;
 
 /// git for a test's own temp repo, with its HOME and identity and no system config. A git hook
@@ -32,7 +32,7 @@ impl Fake {
         let (ours, theirs) = UnixStream::pair().unwrap();
         let slot = Arc::new(Slot::default());
         let reader = Reader { live: slot.live.clone(), woke: slot.woke.clone(), epoch: 0, settings: settings(), folders: json!([{"uri": "file:///w", "name": "w"}]), log: None };
-        let peer = Peer::start(BufReader::new(ours.try_clone().unwrap()), ours, Framing::Headers, Dialect::Lsp, Arc::new(reader));
+        let peer = Peer::start(BufReader::new(ours.try_clone().unwrap()), ours, Framing::Headers, Arc::new(reader));
         let (seen, out) = (Arc::new(Mutex::new(Vec::new())), Arc::new(Mutex::new(theirs.try_clone().unwrap())));
         let (log, writer) = (seen.clone(), out.clone());
         thread::spawn(move || {
@@ -115,7 +115,7 @@ fn a_server_that_ends_once_initialize_answered_has_started_and_the_next_request_
     let (ours, theirs) = UnixStream::pair().unwrap();
     let slot = Arc::new(Slot::default());
     let reader = Reader { live: slot.live.clone(), woke: slot.woke.clone(), epoch: 0, settings: settings(), folders: json!([]), log: None };
-    let peer = Peer::start(BufReader::new(ours.try_clone().unwrap()), ours, Framing::Headers, Dialect::Lsp, Arc::new(reader));
+    let peer = Peer::start(BufReader::new(ours.try_clone().unwrap()), ours, Framing::Headers, Arc::new(reader));
     thread::spawn(move || {
         let init = rpc::read(&mut BufReader::new(&theirs), Framing::Headers, MAX_FRAME).unwrap().unwrap();
         theirs.shutdown(std::net::Shutdown::Read).unwrap();

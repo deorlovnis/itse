@@ -294,12 +294,28 @@ pub fn integrate(ws: &Workspace, dirs: &Dirs, env: &BTreeMap<String, String>, cw
 }
 
 /// The SKILL.md of a harness: the same in every workspace, since what differs (actions, extension
-/// notes, debug) is one `itse verbs` away, and made from the verb table, so it never drifts from
+/// notes) is one `itse verbs` away, and made from the verb table, so it never drifts from
 /// the CLI. It lists the verbs the MCP tools carry; front matter values are quoted for YAML.
 pub fn skill(name: &str, description: &str) -> String {
     let verbs = VERBS.iter().filter(|v| matches!(v.tool, Tool::Run | Tool::Query | Tool::Show));
     let lines: String = verbs.map(|v| format!("- `{}`: {}\n", format!("itse {} {}", v.name, synopsis(v)).trim_end(), v.about)).collect();
     text("skill", &[("name", &json!(name)), ("description", &json!(description)), ("verbs", &lines)])
+}
+
+/// A note for each skill `integrate` wrote, unchanged since, that differs from the one it would
+/// write now, as an older itse's (naming verbs it no longer has) does.
+pub fn stale_skills(dirs: &Dirs, exts: &manifest::Exts) -> Vec<String> {
+    let mut notes = Vec::new();
+    for (key, rec) in records(dirs).unwrap_or_default() {
+        let Some((id, path)) = key.split_once(" skill ") else { continue };
+        let spec = exts.get(id).and_then(|e| serde_json::from_value::<Integration>(e.0.integration.clone()?).ok()?.skill);
+        let (Some(s), Ok(bytes)) = (spec, fs::read(path)) else { continue };
+        let written = sys::sha256_hex(&bytes);
+        if rec["sha256"] == written.as_str() && written != sys::sha256_hex(skill(&s.name, &s.description).as_bytes()) {
+            notes.push(format!("skill: {path} is an older itse's; 'itse integrate {id} --skill --yes' updates it"));
+        }
+    }
+    notes
 }
 
 /// What `integrate` did, by step, in `integrations.json`: who (`tty` or `non-tty`), when, and the

@@ -18,10 +18,7 @@ const KOTLIN: &str = r#"{ "itse_ext": 1, "id": "kotlin", "version": "0.1.0", "re
 { "id": "kotlin-lsp", "protocol": "lsp", "transport": "stdio",
   "command": ["${pkg:kotlin-lsp}/bin/intellij-server", "--stdio", "--system-path=${cache}/kotlin-lsp", "${consent:eula}"],
   "filetypes": ["kt","kts"], "languages": { "kt": "kotlin", "kts": "kotlin" },
-  "env": { "JAVA_HOME": "${pkg:jdk}" }, "init_options": { "defaultSdk": "${pkg:jdk}", "buildTools": ["gradle"] } },
-{ "id": "kotlin-dap", "protocol": "dap", "adapter_id": "intellij_debugger",
-  "via": { "lsp_command": { "server": "kotlin-lsp", "command": "start_debug_server" } },
-  "hide_vars": ["^\\$i\\$a\\$"] } ],
+  "env": { "JAVA_HOME": "${pkg:jdk}" }, "init_options": { "defaultSdk": "${pkg:jdk}", "buildTools": ["gradle"] } } ],
   "problemMatchers": { "kotlinc": { "owner": "kotlinc", "fileLocation": "absolute",
   "pattern": { "regexp": "^([ew]): file://([^:]+):(\\d+):(\\d+) (.*)$", "severity": 1, "file": 2, "line": 3, "column": 4, "message": 5 } } },
   "skills": [ { "name": "kotlin-module-scoped", "text": "Gradle runs per module: itse test :data." } ] }"#;
@@ -37,14 +34,14 @@ const GRADLE_TEST: &str = r#"{ "label": "gradle:test", "type": "process", "comma
 const LAYER: &str = r#"{ "itse": 1, "repo": "/work/crm/.git",
   "use": { "jdk": { "version": "25.0.5+8" }, "kotlin": {}, "gradle": {}, "node": { "install": "path" } },
   "system": { "libheif": { "lib": "libheif.so.1" }, "docker": { "cmd": ["docker","info"] } },
-  "servers": { "kotlin-lsp": { "idle_minutes": 60 }, "some-mcp": { "expose": true, "tools": ["search", "fetch"], "max_list_bytes": 900 } },
+  "servers": { "kotlin-lsp": { "idle_minutes": 60 } },
   "inputs": [ { "id": "target", "type": "promptString" }, { "id": "filter", "type": "promptString" } ] }"#;
 
 const CLAUDE_CODE: &str = r#"{ "itse_ext": 1, "id": "claude-code",
   "identity": { "session_env": "CLAUDE_CODE_SESSION_ID", "client_env": "AI_AGENT",
             "client_regexp": "^(claude-code)_(\\d+)-(\\d+)-(\\d+)_", "hook_session_from": "/session_id" },
   "integration": {
-"skill": { "path": "~/.claude/skills/itse/SKILL.md", "name": "itse", "description": "Workspace facts from itse: tests, problems, symbols by name, debug snapshots" },
+"skill": { "path": "~/.claude/skills/itse/SKILL.md", "name": "itse", "description": "Workspace facts from itse: tests, problems, symbols by name" },
 "mcp":   { "add": ["claude", "mcp", "add-json", "itse", "${json}", "--scope", "local"], "remove": ["claude", "mcp", "remove", "itse", "--scope", "local"],
            "cwd": "${workspaceFolder}", "value": {"type":"stdio","command":"itse","args":["mcp"]} },
 "recipes": { "post-edit": { "file": "~/.claude/settings.json", "pointer": "/hooks/PostToolUse", "append":
@@ -59,7 +56,6 @@ fn a_full_kotlin_extension_parses() {
     assert!(matches!(&lsp.pin_source, Some(PinSource::OpenvsxBundle { extension, .. }) if extension == "JetBrains/kotlin-server"));
     assert_eq!((lsp.consents.len(), lsp.exit_codes["7"].as_str()), (3, "server_expired"));
     assert_eq!(ext.servers[0].protocol, Protocol::Lsp);
-    assert_eq!(ext.servers[1].via, Some(DapVia::LspCommand { server: "kotlin-lsp".into(), command: "start_debug_server".into(), arguments: vec![] }));
     assert!(matches!(&ext.problem_matchers["kotlinc"].pattern, Some(OneOrMany::One(p)) if p.message == Some(5)));
 }
 
@@ -71,7 +67,7 @@ fn a_gradle_action_and_a_workspace_layer_parse() {
     assert!(action.extra.is_empty());
     let layer: Layer = serde_json::from_str(LAYER).unwrap();
     assert_eq!(layer.uses["node"]["install"], "path");
-    assert_eq!(layer.servers["some-mcp"].max_list_bytes, Some(900));
+    assert_eq!(layer.servers["kotlin-lsp"].idle_minutes, Some(60));
 }
 
 #[test]
@@ -98,11 +94,19 @@ fn an_extension_added_with_watch_client_still_reads() {
 }
 
 #[test]
-fn a_dap_adapter_is_reached_by_program_tcp_or_lsp_command() {
-    let via = |s: &str| serde_json::from_str::<DapVia>(s).unwrap();
-    assert_eq!(via(r#""program""#), DapVia::Program);
-    assert_eq!(via(r#"{"tcp": {"argv": ["a"], "port": 5005}}"#), DapVia::Tcp { argv: vec!["a".into()], port: 5005 });
-    assert!(serde_json::from_str::<DapVia>(r#"{"tcp": {"argv": [], "port": 1, "host": "10.0.0.1"}}"#).is_err());
+fn the_keys_of_debug_adapters_and_hosted_mcp_servers_still_read_and_are_ignored() {
+    let ext = r#"{"itse_ext": 1, "id": "old", "servers": [
+        {"id": "ls", "command": ["ls"], "filetypes": ["rs"]},
+        {"id": "dbg", "protocol": "dap", "adapter_id": "lldb", "via": {"tcp": {"argv": ["a"], "port": 5005}}, "hide_vars": ["^\\$"]},
+        {"id": "tools", "protocol": "mcp", "transport": "stdio", "command": ["t"], "timeout_s": 30}],
+      "debug": {"adapter": "dbg", "request": "launch", "arguments": {"program": "${workspaceFolder}/t"}, "project_packages": ["app."]}}"#;
+    let ext = parse_ext(ext, "old.json").map_err(|e| format!("{e:#}")).unwrap();
+    assert_eq!(ext.servers.iter().map(|s| s.protocol).collect::<Vec<_>>(), [Protocol::Lsp, Protocol::Dap, Protocol::Mcp]);
+    assert!(serde_json::from_str::<Server>(r#"{"id": "x", "protocol": "lps"}"#).is_err(), "an unknown protocol is still a typo");
+    let layer = r#"{"itse": 1, "servers": {"tools": {"expose": true, "tools": ["search"], "max_list_bytes": 900, "idle_minutes": 5}}}"#;
+    assert_eq!(serde_json::from_str::<Layer>(layer).unwrap().servers["tools"].idle_minutes, Some(5));
+    let config: Config = serde_json::from_str(r#"{"usage": false, "mcp": {"debug": true}}"#).unwrap();
+    assert_eq!(config.usage, Some(false), "an old opt-in doesn't cost the rest of the config");
 }
 
 #[test]

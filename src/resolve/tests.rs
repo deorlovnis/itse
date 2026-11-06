@@ -374,10 +374,74 @@ fn team_server_settings_wait_for_trust_and_init_options_are_rendered() {
     fs::create_dir_all(fx.ws.root.join(".itse")).unwrap();
     fs::write(fx.ws.root.join(".itse/itse.json"), r#"{"itse": 1, "servers": {"hello-ls": {"expose": true, "settings": {"x": 1}}}}"#).unwrap();
     let l = &fx.resolve().launches[0];
-    assert_eq!((l.expose, &l.settings), (false, &Value::Null), "an untrusted team layer sets nothing");
+    assert_eq!(l.settings, Value::Null, "an untrusted team layer sets nothing");
     let (root, cache) = (fx.ws.root.display().to_string(), fx.dirs.cache.display().to_string());
     assert_eq!(l.init_options, json!({"root": root, "n": [1, cache]}));
     fx.trust();
     let l = &fx.resolve().launches[0];
-    assert_eq!((l.expose, &l.settings), (false, &json!({"x": 1})), "a trusted team layer sets settings, but exposing tools is the developer's choice");
+    assert_eq!(l.settings, json!({"x": 1}), "a trusted team layer sets settings; its retired `expose` is ignored");
+}
+
+#[test]
+fn servers_of_retired_protocols_load_and_never_launch_or_ask_for_trust() {
+    let fx = Fx::new();
+    let tmp = TempDir::new("itse-resolve-ext");
+    let old = json!({"itse_ext": 1, "id": "old", "packages": {"hello-ls": {"install": "path"}},
+        "servers": [{"id": "hello-ls", "command": ["${pkg:hello-ls}/hello-ls"]},
+            {"id": "old-dap", "protocol": "dap", "via": {"lsp_command": {"server": "hello-ls", "command": "start_debug_server"}}, "hide_vars": ["^x"]},
+            {"id": "old-mcp", "protocol": "mcp", "command": ["${pkg:hello-ls}/hello-ls"], "executes_project_code": true, "timeout_s": 30}],
+        "debug": {"adapter": "old-dap", "arguments": {"program": "${workspaceFolder}/t"}}});
+    fs::write(tmp.0.join("old.json"), old.to_string()).unwrap();
+    ext(&fx.ws, &fx.dirs, &tmp.0, &Args { target: Some("add".into()), rest: vec!["old.json".into()], ..Args::default() }, "tty").unwrap();
+    fx.tool("hello-ls");
+    fx.use_("old", &[]);
+    let dev = fx.dirs.config.join("workspaces/work.json");
+    let mut layer: Value = serde_json::from_slice(&fs::read(&dev).unwrap()).unwrap();
+    layer["servers"] = json!({"old-mcp": {"expose": true, "tools": ["search"], "max_list_bytes": 900}});
+    fs::write(&dev, layer.to_string()).unwrap();
+    let r = fx.resolve();
+    assert_eq!(r.launches.iter().map(|l| l.id.as_str()).collect::<Vec<_>>(), ["hello-ls"]);
+    assert!(r.trusted && !r.states.iter().any(|s| s.item == "workspace"), "a server that never starts runs no project code: {:?}", r.states);
+    let ignored: Vec<&String> = r.notes.iter().filter(|n| n.ends_with("is no longer hosted; ignored")).collect();
+    assert_eq!(ignored, ["old-dap: protocol dap is no longer hosted; ignored", "old-mcp: protocol mcp is no longer hosted; ignored"]);
+    let shown = ext(&fx.ws, &fx.dirs, &tmp.0, &Args { target: Some("show".into()), rest: vec!["old".into()], ..Args::default() }, "tty").unwrap().notes;
+    assert!(shown.contains(&"servers: hello-ls, old-dap (dap, no longer hosted), old-mcp (mcp, no longer hosted)".to_string()), "{shown:?}");
+}
+
+#[test]
+fn trust_given_while_debug_adapters_and_mcp_servers_were_hosted_still_holds() {
+    let fx = Fx::new();
+    let tmp = TempDir::new("itse-resolve-ext");
+    let old = json!({"itse_ext": 1, "id": "old", "servers": [
+            {"id": "ls", "command": ["ls"], "executes_project_code": true},
+            {"id": "dbg", "protocol": "dap", "command": ["dbg"], "via": {"lsp_command": {"server": "ls", "command": "start"}}},
+            {"id": "tools", "protocol": "mcp", "command": ["t"], "executes_project_code": true}],
+        "debug": {"adapter": "dbg", "request": "launch", "arguments": {"program": "t"}, "project_packages": ["app."]}});
+    fs::write(tmp.0.join("old.json"), old.to_string()).unwrap();
+    ext(&fx.ws, &fx.dirs, &tmp.0, &Args { target: Some("add".into()), rest: vec!["old.json".into()], ..Args::default() }, "tty").unwrap();
+    fx.use_("old", &[]);
+    // The entries as the itse that hosted them hashed them.
+    let ls = json!({"server": "ls", "command": ["ls"], "env": {}});
+    let via = json!({"lsp_command": {"server": "ls", "command": "start", "arguments": []}});
+    let dbg = json!({"server": "dbg", "command": ["dbg"], "env": {}, "via": via, "debug": {"request": "launch", "arguments": {"program": "t"}, "attach": null}});
+    let tools = json!({"server": "tools", "command": ["t"], "env": {}});
+    let r = fx.resolve();
+    assert_eq!((r.trusted, r.trust_hash.as_str()), (false, lock::trust_hash(b"", std::slice::from_ref(&ls)).as_str()), "only what runs now is hashed");
+    lock::trust(&fx.dirs, &fx.ws, &lock::trust_hash(b"", &[ls.clone(), dbg.clone()]), false, "tty").unwrap();
+    assert!(!fx.resolve().trusted, "trust in another set of entries is no trust in these");
+    lock::trust(&fx.dirs, &fx.ws, &lock::trust_hash(b"", &[ls, dbg, tools]), false, "tty").unwrap();
+    assert!(fx.resolve().trusted, "an upgrade keeps trust");
+}
+
+#[test]
+fn trust_given_to_the_built_in_kotlin_with_its_debug_adapter_still_holds() {
+    let fx = Fx::new();
+    fx.use_("kotlin", &[]);
+    let r = fx.resolve();
+    assert!(!r.trusted);
+    let lsp = r.manifest.exts["kotlin"].0.servers.iter().find(|s| s.id == "kotlin-lsp").unwrap();
+    let via = json!({"lsp_command": {"server": "kotlin-lsp", "command": "start_debug_server", "arguments": []}});
+    let entries = [json!({"server": "kotlin-lsp", "command": lsp.command, "env": lsp.env}), json!({"server": "kotlin-dap", "command": [], "env": {}, "via": via})];
+    lock::trust(&fx.dirs, &fx.ws, &lock::trust_hash(b"", &entries), false, "tty").unwrap();
+    assert!(fx.resolve().trusted, "the hash the kotlin extension had with kotlin-dap is still trust");
 }

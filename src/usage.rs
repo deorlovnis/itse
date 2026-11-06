@@ -54,10 +54,6 @@ pub enum Event {
         list_bytes: u64,
     },
     Call(Call),
-    /// A debug session's attach: `ok` or `fail`, nothing else.
-    Attach {
-        outcome: &'static str,
-    },
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -67,7 +63,7 @@ pub struct Call {
     /// Clipped to 64 chars, control characters as `?`.
     pub client: String,
     pub client_v: Option<String>,
-    /// From the closed verb table, `ext_tool` for an exposed server's tool, or `unknown`.
+    /// From the closed verb table, or `unknown`.
     pub verb: String,
     pub ext: Option<String>,
     pub ms: u64,
@@ -247,7 +243,7 @@ pub fn stats(dirs: &Dirs, args: &Args, offered: &[&str]) -> Result<String> {
     }
     let (mut groups, mut inits, mut callers, mut wss, mut called, mut errors) =
         (BTreeMap::<String, Group>::new(), BTreeMap::new(), BTreeSet::new(), BTreeSet::new(), BTreeSet::new(), BTreeMap::new());
-    let (mut size, mut attaches) = (0, BTreeMap::<String, u64>::new());
+    let mut size = 0;
     for name in ["usage.1.jsonl", "usage.jsonl"] {
         let Ok(file) = File::open(dirs.state.join(name)) else { continue };
         size += file.metadata().map_or(0, |m| m.len());
@@ -262,8 +258,8 @@ pub fn stats(dirs: &Dirs, args: &Args, offered: &[&str]) -> Result<String> {
                 inits.insert(sess, client);
                 continue;
             }
-            if r["ev"] == "attach" {
-                *attaches.entry(s("outcome")).or_default() += 1;
+            // An older log's other events (debug attaches) count for nothing now.
+            if r["ev"] != "call" {
                 continue;
             }
             callers.insert(sess);
@@ -304,9 +300,7 @@ pub fn stats(dirs: &Dirs, args: &Args, offered: &[&str]) -> Result<String> {
             })
             .collect();
         return Ok(
-            json!({"since": since, "until": until, "calls": calls, "sessions": sessions, "groups": groups, "idle_sessions": idle.len(), "never_called": never, "attaches": attaches})
-                .to_string()
-                + "\n"
+            json!({"since": since, "until": until, "calls": calls, "sessions": sessions, "groups": groups, "idle_sessions": idle.len(), "never_called": never}).to_string() + "\n"
         );
     }
     let mut out = format!("usage {}..{} ({span}): {} calls, {sessions} sessions, {} workspaces; log {}\n", &since[..10], &until[..10], num(calls), wss.len(), mb(size));
@@ -325,10 +319,6 @@ pub fn stats(dirs: &Dirs, args: &Args, offered: &[&str]) -> Result<String> {
     }
     if !never.is_empty() {
         out += &format!("offered, never called: {}\n", never.join(", "));
-    }
-    if !attaches.is_empty() {
-        let n = |k: &str| attaches.get(k).copied().unwrap_or(0);
-        out += &format!("debug attaches: {} ok, {} failed\n", n("ok"), n("fail"));
     }
     if !errors.is_empty() {
         let list: Vec<String> = errors.iter().map(|((e, ext), n)| format!("{e} {n}{}", ext.as_ref().map_or(String::new(), |x| format!(" ({x})")))).collect();

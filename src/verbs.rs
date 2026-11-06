@@ -7,8 +7,8 @@
 //! `use`, `unuse`, `ext`, `trust` and `consent`, the store's: `install`, `lock` and `gc`, and status
 //! rows; `run`, `build`, `test`, `cancel` and `stop` (in `actions`), `problems` over action
 //! results (in `parse`) and the language servers' diagnostics, `find`, `refs`, `info` and
-//! `outline` on the language servers (in `lsp`), `debug` on debug adapters (in `dap`), `ext tools`
-//! on hosted MCP servers (in `mcp::client`), and `integrate` and `hook` for harnesses (in `harness`).
+//! `outline` on the language servers (in `lsp`), and `integrate` and `hook` for harnesses (in
+//! `harness`).
 
 pub mod harness;
 
@@ -43,7 +43,6 @@ pub enum Tool {
     Query,
     Run,
     Show,
-    Debug,
     CliOnly,
 }
 
@@ -97,7 +96,7 @@ pub const VERBS: &[Verb] = &[
     verb("lock", Tool::Run, Daemon, &[Flag("refresh"), Opt("target"), Pos("pkg")], "refresh pins from their sources; installs nothing"),
     human(verb("trust", Tool::CliOnly, Daemon, &[Flag("revoke")], "trust this workspace to run project code")),
     human(verb("consent", Tool::CliOnly, Daemon, &[Req("pkg"), Opt("eula-hash"), Opt("region"), Opt("data-sharing")], "record consent to a package's terms")),
-    verb("ext", Tool::Query, Daemon, &[Pos("list|show|tools|add|remove"), Pos("id")], "list, show, add or remove extensions"),
+    verb("ext", Tool::Query, Daemon, &[Pos("list|show|add|remove"), Pos("id")], "list, show, add or remove extensions"),
     verb("env", Tool::CliOnly, Local, &[Flag("sh")], "the composed environment"),
     verb("exec", Tool::CliOnly, Local, &[Rest("cmd")], "run a command in the composed environment"),
     verb("gc", Tool::CliOnly, Daemon, &[Flag("keep-locked")], "remove unused packages and old results"),
@@ -109,15 +108,8 @@ pub const VERBS: &[Verb] = &[
     verb("info", Tool::Query, Daemon, &[Req("name")], "a symbol's signature, docs and location"),
     verb("refs", Tool::Query, Daemon, &[Req("name")], "references to a symbol, by file"),
     verb("outline", Tool::Query, Daemon, &[Req("path")], "a file's symbols"),
-    verb(
-        "debug",
-        Tool::Debug,
-        Daemon,
-        &[Pos("test|attach|step|continue|eval|snapshot|stop"), Rest("args"), Many("at"), Many("log"), Opt("frame")],
-        "debug a test: test [target] [filter|run:N/T1], attach <host:port>, step <dbg> [over|in|out], continue|snapshot|stop <dbg>, eval <dbg> <expr>",
-    ),
     verb("show", Tool::Show, Daemon, &[Req("id"), Opt("page"), Flag("raw"), Opt("grep"), Opt("tail"), Flag("json")], "a stored result or log by id"),
-    verb("stop", Tool::Run, Daemon, &[Req("handle")], "stop a server or debug session"),
+    verb("stop", Tool::Run, Daemon, &[Req("handle")], "stop a server"),
     verb("cancel", Tool::Run, Daemon, &[Req("run")], "cancel a run"),
     verb("stats", Tool::CliOnly, Local, &[Opt("since"), Opt("by"), Flag("json")], "the local usage log, summed"),
     verb("verbs", Tool::CliOnly, Local, &[Flag("json")], "the verb index"),
@@ -210,7 +202,7 @@ pub fn call(host: &Arc<Host>, caller: &Caller, params: &Value, cancel: &Cancel) 
             sh(Outcome { err: Some("needs_human"), ..Outcome::new(v.name, Verdict::NeedsHuman, "", counts) }, 1)
         }
         Some((v, Ok(_))) if via == "mcp" && v.tool == Tool::CliOnly => sh(Outcome::error(v.name, "bad_args", text("cli_only", &[])), 1),
-        // A tool carries the verbs of its enum only, so `debug` stays out of reach until opted in.
+        // A tool carries the verbs of its enum only.
         Some((v, Ok(_))) if via == "mcp" && params["tool"] != crate::mcp::tool_name(v.tool) => {
             sh(Outcome::error(v.name, "bad_args", text("wrong_tool", &[("tool", &params["tool"].as_str().unwrap_or(""))])), 1)
         }
@@ -249,18 +241,14 @@ pub fn call(host: &Arc<Host>, caller: &Caller, params: &Value, cancel: &Cancel) 
                 sh(o.unwrap_or_else(|e| Outcome::error("problems", "io", format!("{e:#}"))), page)
             }
             "cancel" | "stop" => sh(stop(host, v.name, args.target.as_deref().unwrap_or_default()), page),
-            "debug" => sh(crate::dap::debug(host, caller, &args, wait, cancel), page),
             "find" => sh(crate::lsp::find(host, &caller.env, args.target.as_deref().unwrap_or_default(), args.flags.get("kind").and_then(Value::as_str), cancel), page),
             "refs" => sh(crate::lsp::refs(host, &caller.env, session, args.target.as_deref().unwrap_or_default(), cancel).unwrap_or_else(|o| *o), page),
             "info" => sh(crate::lsp::info(host, &caller.env, session, args.target.as_deref().unwrap_or_default(), cancel).unwrap_or_else(|o| *o), page),
             "outline" => sh(crate::lsp::outline(host, &caller.env, &caller.cwd, args.target.as_deref().unwrap_or_default(), cancel).unwrap_or_else(|o| *o), page),
-            "ext" if args.target.as_deref() == Some("tools") => sh(crate::mcp::client::ext_tools(host, caller, args.rest.first().map_or("", String::as_str), cancel), page),
             "use" | "unuse" | "ext" | "trust" | "consent" => {
                 let o = manifest_verb(&host.ws, &host.dirs, &caller.env, &caller.cwd, v.name, &args, params["tty"] == true);
                 // A revoked trust or an unused extension leaves a server that may no longer run: it stops now.
                 let _ = crate::lsp::servers(host, &caller.env, v.name, "", &|_| false, false, cancel);
-                let _ = crate::mcp::client::resolved(host, &caller.env);
-                crate::dap::untrusted(host, &caller.env);
                 sh(o, page)
             }
             _ => sh(Outcome::error(v.name, "internal", text("not_built", &[])), 1),
@@ -325,8 +313,6 @@ fn exit(a: &Answer) -> u8 {
     match a.verdict {
         _ if a.err == Some("cancel") => 130,
         Verdict::Fail => 1,
-        // A debug start that never stopped did not do what it was for.
-        Verdict::Exited if ["EXITED debug test", "EXITED debug attach"].iter().any(|p| a.text.starts_with(p)) => 1,
         Verdict::Empty if a.text.split(' ').nth(1).is_some_and(|v| matches!(v, "find" | "info" | "refs")) => 1,
         Verdict::Error => 2,
         Verdict::NeedsHuman | Verdict::NeedsConsent | Verdict::Untrusted | Verdict::Blocked => 3,
@@ -422,11 +408,8 @@ fn pick(declared: &[&manifest::Action], verb: &str, args: &Args) -> Result<Strin
 }
 
 /// `cancel run:N` and `stop <handle>`: a live run gets the escalation (and answers how it ended,
-/// as does one that already had); a server is stopped, and a debug session disconnected.
+/// as does one that already had); a server is stopped.
 pub fn stop(host: &Host, verb: &str, target: &str) -> Outcome {
-    if verb == "stop" && target.starts_with("dbg:") {
-        return crate::dap::stop(host, verb, target);
-    }
     let Some(n) = target.strip_prefix("run:").filter(|n| n.parse::<u64>().is_ok()) else {
         // A server's bare id (`rust-analyzer`) names its handle when only one has it.
         let named: Vec<String> = sys::lock(&host.slots).keys().filter(|h| h.split_once(':').is_some_and(|(_, id)| id == target)).cloned().collect();
@@ -522,10 +505,7 @@ pub fn local(usage: &Usage, ws: &Workspace, dirs: &Dirs, verb: &Verb, args: &Arg
     let (started, env): (_, BTreeMap<String, String>) = (Instant::now(), std::env::vars().collect());
     let caller = Caller { id: usage.ident("cli", &env), mode: "cli".into(), env, ..Caller::default() };
     let answer = if verb.name == "verbs" {
-        // `debug` is listed where an extension in use declares how its tests run under a debugger.
-        let r = resolve(ws, dirs, &caller.env, SystemTime::now());
-        let debug = r.is_ok_and(|r| r.manifest.uses().iter().filter_map(|u| r.manifest.exts.get(&u.id)).any(|e| e.0.debug.as_ref().is_some_and(|d| !d.adapter.is_empty())));
-        let text = index(args.flags.contains_key("json"), debug);
+        let text = index(args.flags.contains_key("json"));
         Answer { verdict: Verdict::Ok, full: text.len() as u64, text, ..Answer::default() }
     } else {
         let cwd = std::env::current_dir().unwrap_or_default();
@@ -541,14 +521,10 @@ pub fn local(usage: &Usage, ws: &Workspace, dirs: &Dirs, verb: &Verb, args: &Arg
 }
 
 /// `itse verbs [--json]`: the verb index for agents, from the table, without human-only and
-/// internal verbs, and with `debug` only if `debug`. Declared actions and extension skills are
-/// not listed yet.
-pub fn index(json: bool, debug: bool) -> String {
-    let rows: Vec<(&str, String, &str, &str)> = VERBS
-        .iter()
-        .filter(|v| !v.human_only && !v.name.starts_with("__") && (debug || v.tool != Tool::Debug))
-        .map(|v| (v.name, synopsis(v), crate::mcp::tool_name(v.tool), v.about))
-        .collect();
+/// internal verbs. Declared actions and extension skills are not listed yet.
+pub fn index(json: bool) -> String {
+    let rows: Vec<(&str, String, &str, &str)> =
+        VERBS.iter().filter(|v| !v.human_only && !v.name.starts_with("__")).map(|v| (v.name, synopsis(v), crate::mcp::tool_name(v.tool), v.about)).collect();
     if json {
         let verbs: Vec<Value> = rows.iter().map(|(n, a, t, about)| json!({"name": n, "args": a, "tool": t, "about": about})).collect();
         return json!({"verbs": verbs, "actions": [], "skills": []}).to_string() + "\n";
@@ -559,19 +535,13 @@ pub fn index(json: bool, debug: bool) -> String {
 
 /// A verb's arguments as the index and the skill show them: `<name> [--kind V]`.
 pub fn synopsis(v: &Verb) -> String {
-    let value = |n: &str| match n {
-        "at" => "path:line",
-        "log" => "path:line=text",
-        "frame" => "F",
-        _ => "V",
-    };
     let arg = |p: &Param| match p {
         Req(n) => format!("<{n}>"),
         Pos(n) => format!("[{n}]"),
         Rest(n) => format!("[{n}…]"),
         Flag(n) => format!("[--{n}]"),
-        Opt(n) => format!("[--{n} {}]", value(n)),
-        Many(n) => format!("[--{n} {}…]", value(n)),
+        Opt(n) => format!("[--{n} V]"),
+        Many(n) => format!("[--{n} V…]"),
     };
     v.params.iter().map(arg).collect::<Vec<_>>().join(" ")
 }
@@ -592,11 +562,8 @@ fn status(host: &Host, caller: &Caller, args: &Args, cancel: &Cancel) -> Outcome
     let (root, name) = (ws.root.display(), ws.repo_name().display());
     let common = if ws.git { format!("; git common dir {}", ws.repo.display()) } else { String::new() };
     let git = if ws.git { "" } else { "not a git work tree; " };
-    let (debug, bytes) = (host.config().mcp.debug, crate::mcp::list_bytes);
-    let listing = crate::mcp::client::listing(host, &caller.env, debug);
-    let (n, b, cap) = (listing.tools.len(), listing.bytes, crate::mcp::LIST_CAP);
-    let on = if debug { "on".into() } else { format!("off (mcp.debug: true adds ~{} tokens)", (bytes(true) - bytes(false)) * 10 / 36) };
-    let tools = format!("mcp tools: {n} (~{} tokens incl. instructions; list {b} of {cap} B); debug tool {on}", b * 10 / 36);
+    let (n, b, cap) = (crate::mcp::tools().len(), crate::mcp::list_bytes(), crate::mcp::LIST_CAP);
+    let tools = format!("mcp tools: {n} (~{} tokens incl. instructions; list {b} of {cap} B)", b * 10 / 36);
     let log = host.usage.path();
     let usage = if host.usage.on(&caller.env) { format!("on, {} ({:.1} MB)", log.display(), fs::metadata(&log).map_or(0, |m| m.len()) as f64 / 1e6) } else { "off".into() };
     let mut notes = vec![
@@ -605,10 +572,10 @@ fn status(host: &Host, caller: &Caller, args: &Args, cancel: &Cancel) -> Outcome
         format!("daemon: pid {pid}, started by {} {up} s ago; {VERSION}; proto {}; env keys {}", host.started_by, proto(), host.env_keys_sha()),
         format!("socket: {}", host.socket.display()),
         tools,
+        format!("usage log: {usage}; ITSE_USAGE=off or \"usage\": false in {} stops it", host.dirs.config.join("config.json").display()),
     ];
-    notes.extend(listing.notes);
-    notes.extend([format!("usage log: {usage}; ITSE_USAGE=off or \"usage\": false in {} stops it", host.dirs.config.join("config.json").display())]);
     notes.extend(r.notes);
+    notes.extend(harness::stale_skills(&host.dirs, &r.manifest.exts));
     if args.flags.contains_key("hosts") {
         let rows: Vec<String> = r.states.iter().filter(|s| !s.hosts.is_empty()).map(|s| format!("{} from {}", s.item, s.hosts.join(", "))).collect();
         notes.push(format!("hosts: {}", if rows.is_empty() { "none; nothing in use waits for a fetch".into() } else { rows.join("; ") }));
@@ -618,13 +585,8 @@ fn status(host: &Host, caller: &Caller, args: &Args, cancel: &Cancel) -> Outcome
     let counts = [(unready > 0).then(|| format!("{unready} of {} not ready", r.states.len() - suggested)), (suggested > 0).then(|| format!("{suggested} suggested"))];
     let counts = counts.into_iter().flatten().chain([format!("daemon pid {pid}")]).collect::<Vec<_>>().join("; ");
     let verdict = if unready > 0 { Verdict::Unready } else { Verdict::Ok };
-    let servers = r.launches.iter().filter_map(|l| match l.protocol {
-        crate::host::Protocol::Lsp => Some(crate::lsp::row(host, l)),
-        crate::host::Protocol::Mcp => Some(host.row("mcp", l, |_| Vec::new())),
-        crate::host::Protocol::Dap => None,
-    });
-    let debug = crate::dap::rows(host, &r.launches);
-    Outcome { states: r.states.iter().cloned().chain(servers).chain(debug).collect(), notes, ..Outcome::new("status", verdict, root.to_string(), counts) }
+    let servers = r.launches.iter().map(|l| crate::lsp::row(host, l));
+    Outcome { states: r.states.iter().cloned().chain(servers).collect(), notes, ..Outcome::new("status", verdict, root.to_string(), counts) }
 }
 
 // --- daemon status and stop (CLI only) ---
@@ -668,9 +630,7 @@ mod tests {
 
     #[test]
     fn verbs_json_lists_every_verb_in_the_table() {
-        let index_of = |debug: bool| serde_json::from_str::<Value>(&index(true, debug)).unwrap();
-        let (all, plain) = (index_of(true), index(false, true));
-        assert!(!index_of(false)["verbs"].as_array().unwrap().iter().any(|v| v["name"] == "debug"), "debug only where a debug adapter is declared");
+        let (all, plain) = (serde_json::from_str::<Value>(&index(true)).unwrap(), index(false));
         for v in VERBS {
             // Left out: human-only verbs (an agent can't run them) and internal ones.
             let left_out = v.human_only || v.name.starts_with("__");

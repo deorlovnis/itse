@@ -1,6 +1,6 @@
 //! JSON-RPC 2.0 framing and peers: one JSON value per line for MCP and the daemon
-//! socket, `Content-Length` headers for LSP and DAP, and a `Peer` that matches requests with
-//! responses over a child's stdio.
+//! socket, `Content-Length` headers for LSP, and a `Peer` that matches requests with
+//! responses over a language server's stdio.
 //!
 //! One reader thread per peer. Responses go to the request waiting for them; requests from the
 //! other side are answered at once by the `Handler`, so a server that asks something while we wait
@@ -28,16 +28,8 @@ pub const MAX_FRAME: usize = 4 << 20;
 pub enum Framing {
     /// One JSON value per line: MCP and the daemon socket.
     Lines,
-    /// `Content-Length: N\r\n\r\n` before each body: LSP and DAP.
+    /// `Content-Length: N\r\n\r\n` before each body: LSP.
     Headers,
-}
-
-/// How ids are matched, requests cancelled and errors shaped.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum Dialect {
-    Lsp,
-    Mcp,
-    Dap,
 }
 
 /// The next message, or None at EOF before a frame starts. A frame over `max` is read to its end and
@@ -88,13 +80,12 @@ pub fn write(w: &mut impl Write, f: Framing, v: &Value) -> io::Result<()> {
     w.flush()
 }
 
-/// A failed response, in JSON-RPC's and DAP's shape at once, to the id in an oversized frame's head
-/// (its first `"request_seq"` or `"id"`), so the request it answered fails with `response_too_large`
-/// instead of waiting for its timeout.
+/// A failed response to the id in an oversized frame's head (its first `"id"`), so the request it
+/// answered fails with `response_too_large` instead of waiting for its timeout.
 fn too_large(head: &[u8]) -> Value {
-    let key = regex_lite::Regex::new(r#""(?:request_seq|id)"\s*:\s*(\d+)"#).expect("a valid pattern");
+    let key = regex_lite::Regex::new(r#""id"\s*:\s*(\d+)"#).expect("a valid pattern");
     let id: Option<i64> = key.captures(&String::from_utf8_lossy(&head[..head.len().min(4096)])).and_then(|c| c[1].parse().ok());
-    json!({"id": id, "error": {"code": -32603, "message": "response_too_large"}, "type": "response", "request_seq": id, "success": false, "message": "response_too_large"})
+    json!({"id": id, "error": {"code": -32603, "message": "response_too_large"}})
 }
 
 /// What the other side sends us unasked. Calls run on the reader thread inside `catch_unwind`.
@@ -110,12 +101,11 @@ pub trait Handler: Send + Sync {
 }
 
 #[derive(Debug)]
-#[allow(dead_code)] // `data` is for DAP's failed responses
 pub enum RpcError {
     Timeout,
     Cancelled,
     Closed(String),
-    Remote { code: i64, message: String, data: Option<Value> },
+    Remote { code: i64, message: String },
 }
 
 impl std::fmt::Display for RpcError {
@@ -149,23 +139,20 @@ impl Cancel {
 /// The requests in flight and, once the reader has ended, why.
 type Pending = (HashMap<i64, mpsc::Sender<Result<Value, RpcError>>>, Option<String>);
 
-/// One JSON-RPC (or DAP) connection, with its reader thread.
+/// One JSON-RPC connection, with its reader thread.
 pub struct Peer {
     /// To the writer thread, which writes the frames in order and ends at the first failed write.
     writer: mpsc::Sender<Value>,
     framing: Framing,
-    dialect: Dialect,
     next: AtomicI64,
     /// The requests in flight and, once the reader has ended, why.
     state: Mutex<Pending>,
-    /// DAP sends `cancel` only to adapters that declared `supportsCancelRequest`.
-    pub dap_cancel: AtomicBool,
 }
 
 impl Peer {
-    pub fn start(r: impl BufRead + Send + 'static, mut w: impl Write + Send + 'static, f: Framing, d: Dialect, h: Arc<dyn Handler>) -> Arc<Peer> {
+    pub fn start(r: impl BufRead + Send + 'static, mut w: impl Write + Send + 'static, f: Framing, h: Arc<dyn Handler>) -> Arc<Peer> {
         let (writer, frames) = mpsc::channel();
-        let peer = Arc::new(Peer { writer, framing: f, dialect: d, next: AtomicI64::new(1), state: Mutex::default(), dap_cancel: AtomicBool::new(false) });
+        let peer = Arc::new(Peer { writer, framing: f, next: AtomicI64::new(1), state: Mutex::default() });
         // A null frame is the end of the stream: the writer is dropped, so the other side reads EOF.
         thread::spawn(move || frames.into_iter().take_while(|v: &Value| !v.is_null()).try_for_each(|v| write(&mut w, f, &v)));
         let reader = peer.clone();
@@ -173,8 +160,8 @@ impl Peer {
         peer
     }
 
-    /// Wait for the response in 100 ms steps, checking `cancel`. A timeout or a cancel sends the
-    /// dialect's cancel and drops the entry, so a late response is ignored.
+    /// Wait for the response in 100 ms steps, checking `cancel`. A timeout or a cancel sends
+    /// `$/cancelRequest` and drops the entry, so a late response is ignored.
     pub fn request(&self, method: &str, params: Value, timeout: Duration, cancel: &Cancel) -> Result<Value, RpcError> {
         let (id, (tx, rx)) = (self.next.fetch_add(1, Ordering::SeqCst), mpsc::channel());
         lock(&self.state).0.insert(id, tx);
@@ -196,29 +183,10 @@ impl Peer {
             }
         };
         lock(&self.state).0.remove(&id);
-        let _ = match self.dialect {
-            _ if matches!(err, RpcError::Closed(_)) => Ok(()),
-            Dialect::Lsp => self.notify("$/cancelRequest", json!({"id": id})),
-            Dialect::Mcp => self.notify("notifications/cancelled", json!({"requestId": id, "reason": err.to_string()})),
-            Dialect::Dap if self.dap_cancel.load(Ordering::SeqCst) => self.notify("cancel", json!({"requestId": id})),
-            Dialect::Dap => Ok(()),
-        };
-        Err(err)
-    }
-
-    /// A request sent now, whose answer comes on the receiver (closed, if the reader has ended or
-    /// ends): for an answer awaited later, as DAP's `launch`, which some adapters answer only after
-    /// `configurationDone`. Nothing cancels it.
-    pub fn send_request(&self, method: &str, params: Value) -> mpsc::Receiver<Result<Value, RpcError>> {
-        let (id, (tx, rx)) = (self.next.fetch_add(1, Ordering::SeqCst), mpsc::channel());
-        let mut state = lock(&self.state);
-        match state.1.clone() {
-            Some(why) => drop(tx.send(Err(RpcError::Closed(why)))),
-            None => drop(state.0.insert(id, tx)),
+        if !matches!(err, RpcError::Closed(_)) {
+            let _ = self.notify("$/cancelRequest", json!({"id": id}));
         }
-        drop(state);
-        let _ = self.send(self.message(Some(id), method, params));
-        rx
+        Err(err)
     }
 
     pub fn notify(&self, method: &str, params: Value) -> io::Result<()> {
@@ -230,30 +198,21 @@ impl Peer {
         lock(&self.state).1.clone()
     }
 
-    /// The dialect's goodbye before the process is stopped: LSP `shutdown` (waiting up to `wait`)
-    /// and `exit`; MCP's stdio ends the stream. False when the dialect has none, so nobody waits
-    /// for an exit.
+    /// The goodbye before the process is stopped: LSP `shutdown` (waiting up to `wait`) and
+    /// `exit`. False once the stream has closed, so nobody waits for an exit.
     pub fn bye(&self, wait: Duration) -> bool {
         if self.closed().is_some() {
             return false;
         }
-        match self.dialect {
-            Dialect::Lsp => {
-                let _ = self.request("shutdown", Value::Null, wait, &Cancel::default());
-                self.notify("exit", Value::Null).is_ok()
-            }
-            Dialect::Mcp => self.send(Value::Null).is_ok(),
-            Dialect::Dap => false,
-        }
+        let _ = self.request("shutdown", Value::Null, wait, &Cancel::default());
+        self.notify("exit", Value::Null).is_ok()
     }
 
-    /// A request, or without an id a notification. DAP has no notifications: there it is a request
-    /// whose response nobody waits for.
+    /// A request, or without an id a notification.
     fn message(&self, id: Option<i64>, method: &str, params: Value) -> Value {
-        match (self.dialect, id) {
-            (Dialect::Dap, _) => json!({"seq": id.unwrap_or_else(|| self.next.fetch_add(1, Ordering::SeqCst)), "type": "request", "command": method, "arguments": params}),
-            (_, Some(id)) => json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}),
-            (_, None) => json!({"jsonrpc": "2.0", "method": method, "params": params}),
+        match id {
+            Some(id) => json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}),
+            None => json!({"jsonrpc": "2.0", "method": method, "params": params}),
         }
     }
 
@@ -285,29 +244,18 @@ impl Peer {
     }
 
     fn dispatch(&self, mut msg: Value, h: &dyn Handler) {
-        // DAP in JSON-RPC's shape first, so one path serves all three dialects.
-        if self.dialect == Dialect::Dap {
-            msg = match msg["type"].as_str() {
-                Some("response") if msg["success"] == true => json!({"id": msg["request_seq"], "result": msg["body"].take()}),
-                Some("response") => json!({"id": msg["request_seq"], "error": {"code": 0, "message": msg["message"].as_str().unwrap_or("failed"), "data": msg["body"]}}),
-                Some("event") => json!({"method": msg["event"], "params": msg["body"].take()}),
-                _ => json!({"id": msg["seq"], "method": msg["command"], "params": msg["arguments"].take()}),
-            };
-        }
         match (msg["id"].take(), msg["method"].as_str().map(str::to_string)) {
             (Value::Null, Some(method)) => h.notify(&method, msg["params"].take()),
             // A response; one without an id (an oversized frame whose head held none) answers nothing.
             (id, None) => {
                 let e = msg["error"].take();
-                let remote = || RpcError::Remote { code: e["code"].as_i64().unwrap_or(0), message: e["message"].as_str().unwrap_or("").into(), data: e.get("data").cloned() };
+                let remote = || RpcError::Remote { code: e["code"].as_i64().unwrap_or(0), message: e["message"].as_str().unwrap_or("").into() };
                 id.as_i64().and_then(|id| lock(&self.state).0.remove(&id)).map(|tx| tx.send(if e.is_null() { Ok(msg["result"].take()) } else { Err(remote()) }));
             }
             (id, Some(method)) => {
-                let _ = self.send(match (self.dialect, h.request(&method, msg["params"].take())) {
-                    (Dialect::Dap, reply) => json!({"seq": self.next.fetch_add(1, Ordering::SeqCst), "type": "response", "request_seq": id, "command": method,
-                        "success": reply.is_ok(), "body": reply.as_ref().ok(), "message": reply.as_ref().err().map(|e| &e.1)}),
-                    (_, Ok(result)) => json!({"jsonrpc": "2.0", "id": id, "result": result}),
-                    (_, Err((code, message))) => json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": message}}),
+                let _ = self.send(match h.request(&method, msg["params"].take()) {
+                    Ok(result) => json!({"jsonrpc": "2.0", "id": id, "result": result}),
+                    Err((code, message)) => json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": message}}),
                 });
             }
         }

@@ -19,7 +19,7 @@ use serde_json::{Value, json};
 use crate::host::{Host, Launch, Live, Protocol, Server, Slot};
 use crate::manifest::Server as Declared;
 use crate::results::{Item, Loc, Outcome, State, Store, Verdict, text};
-use crate::rpc::{Cancel, Dialect, Framing, Handler, Peer, RpcError};
+use crate::rpc::{Cancel, Handler, Peer, RpcError};
 use crate::{parse, resolve, sys, sys::lock};
 
 /// Diagnostics kept per server, over all its files; the rest are counted for `status`.
@@ -665,7 +665,7 @@ impl Ask {
 /// `lsp:<id>` up for a query, started on demand by the first caller while the others wait for it,
 /// unless `start` is false: then None if it isn't up.
 fn ask(host: &Arc<Host>, l: &Launch, env: &BTreeMap<String, String>, start: bool, cancel: &Cancel) -> Result<Option<Ask>> {
-    let Some(up) = host.ask("lsp", l, start, cancel, |slot| self::start(host, slot, l, env))? else { return Ok(None) };
+    let Some(up) = host.ask(l, start, cancel, |slot| self::start(host, slot, l, env))? else { return Ok(None) };
     let (root, git) = (host.ws.root.clone(), host.ws.git);
     // A declared output the server makes when it is missing, such as rust-analyzer's Cargo.lock.
     let makes = l.outputs.iter().filter(|o| !o.ends_with('/') && !root.join(o).exists()).map(|o| format!("{} may write {o} into the workspace (a declared output)", l.id));
@@ -683,7 +683,7 @@ fn start(host: &Host, slot: &Slot, l: &Launch, env: &BTreeMap<String, String>) -
         Arc::new(Reader { live: slot.live.clone(), woke: slot.woke.clone(), epoch, settings: l.settings.clone(), folders: folders.clone(), log: Some(Mutex::new(file)) })
             as Arc<dyn Handler>
     };
-    host.start_server(slot, "lsp", l, env, Framing::Headers, Dialect::Lsp, reader, |s| initialize(&s.peer, slot, l, &host.ws.root, folders.clone()))
+    host.start_server(slot, l, env, reader, |s| initialize(&s.peer, slot, l, &host.ws.root, folders.clone()))
 }
 
 /// `initialize` (processId, the root as rootUri and the one workspace folder, clientInfo, the
@@ -741,14 +741,14 @@ pub fn servers(host: &Arc<Host>, caller: &BTreeMap<String, String>, verb: &str, 
     let fail = |err: &'static str, e: String| Box::new(Outcome::error(verb, err, e));
     let r = resolve::resolve_for(&host.ws, &host.dirs, caller, SystemTime::now(), false).map_err(|e| fail("bad_args", format!("{e:#}")))?;
     let all: Vec<&Declared> = r.manifest.uses().iter().filter_map(|u| r.manifest.exts.get(&u.id)).flat_map(|e| &e.0.servers).filter(|s| s.protocol == Protocol::Lsp).collect();
-    let resolved = |id: &str| r.launches.iter().any(|l| l.protocol == Protocol::Lsp && l.id == id);
+    let resolved = |id: &str| r.launches.iter().any(|l| l.id == id);
     let left: Vec<String> = lock(&host.slots).keys().filter(|h| h.strip_prefix("lsp:").is_some_and(|id| !resolved(id))).cloned().collect();
     left.iter().for_each(|h| _ = host.stop_server(h, Duration::from_secs(5)));
     let scoped: Vec<&Declared> = all.iter().copied().filter(|s| serves(&s.filetypes)).collect();
     let untrusted: Vec<String> = scoped.iter().filter(|s| r.held.contains(&s.id)).map(|s| s.id.clone()).collect();
     let missing = |s: &&State| if untrusted.is_empty() { !matches!(s.state.as_str(), "ready" | "unpinned" | "expiring" | "suggested") } else { s.state == "untrusted" };
     let states: Vec<State> = r.states.iter().filter(missing).cloned().collect();
-    let launches: Vec<&Launch> = r.launches.iter().filter(|l| l.protocol == Protocol::Lsp && serves(&l.filetypes)).collect();
+    let launches: Vec<&Launch> = r.launches.iter().filter(|l| serves(&l.filetypes)).collect();
     let unready: Vec<String> = scoped.iter().filter(|s| !resolved(&s.id) && !untrusted.contains(&s.id)).map(|s| s.id.clone()).collect();
     if launches.is_empty() {
         let held = format!("{} runs project code", untrusted.join(", "));
@@ -775,7 +775,7 @@ pub fn servers(host: &Arc<Host>, caller: &BTreeMap<String, String>, verb: &str, 
 
 /// The `status` row of `lsp:<id>`, with its index flag and diagnostics while it is up.
 pub fn row(host: &Host, l: &Launch) -> State {
-    host.row("lsp", l, |live| live.lsp.summary())
+    host.row(l, |live| live.lsp.summary())
 }
 
 /// For the usage log: every server asked was warm (`rust-analyzer index warm`); None if none was asked.

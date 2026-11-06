@@ -285,7 +285,7 @@ fn two_racing_commands_start_one_daemon() {
 #[test]
 fn a_command_during_shutdown_gets_a_new_daemon() {
     let env = Env::new();
-    // The debug-only seam holds the old daemon in its stopping window, where hosted servers will stop.
+    // The debug-only seam holds the old daemon in its stopping window, where its servers stop.
     let out = env.command(&env.work(), &["status"]).env("ITSE_TEST_STOP_MS", "1500").output().unwrap();
     let (old, socket) = (daemon_pid(&stdout(&out)), env.socket());
     signal(old, "TERM");
@@ -661,15 +661,8 @@ impl Env {
 }
 
 #[test]
-fn the_fixture_serves_mcp_echo_and_slow_and_a_tool() {
+fn the_fixture_serves_a_tool() {
     let env = Env::new();
-    let mut mcp = Mcp::start(&mut env.command_of(FIXTURE, &env.dir, &["mcp"]));
-    assert_eq!(mcp.handshake("e2e")["protocolVersion"], "2025-06-18");
-    assert_eq!(mcp.tool_names(), ["echo", "slow"]);
-    assert_eq!(mcp.call("echo", json!({"text": "hi"})), (false, "hi".to_string()));
-    mcp.send(&json!({"jsonrpc": "2.0", "id": 50, "method": "tools/call", "params": {"name": "slow", "arguments": {"ms": 300}}}));
-    assert_eq!(mcp.rpc("ping", json!({})), json!({}), "answered while slow runs");
-    assert_eq!(mcp.recv()["result"]["content"][0]["text"], "slept 300 ms");
     let out = env.command_of(FIXTURE, &env.dir, &["tool", "tar", "-x", "-f", "a.tar"]).output().unwrap();
     let v: Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!((v["tool"].as_str(), v["argv"].clone()), (Some("tar"), json!(["-x", "-f", "a.tar"])));
@@ -690,7 +683,7 @@ fn itse_mcp_relays_the_three_tools_and_starts_the_daemon_as_mcp() {
     assert_eq!(mcp.tool_names(), ["test_build_run", "problems_symbols", "show_result"]);
     let (is_error, text) = mcp.call("problems_symbols", json!({"verb": "status"}));
     assert!(!is_error && text.starts_with(&format!("OK status {} — daemon pid ", env.work().display())), "{text}");
-    assert!(text.contains("\nmcp tools: 3 (~") && text.contains("debug tool off"), "{text}");
+    assert!(text.contains("\nmcp tools: 3 (~"), "{text}");
     assert_eq!(env.daemon_json()["started_by"], "mcp");
     assert_eq!(mcp.close(), (Some(0), String::new()));
 }
@@ -806,7 +799,7 @@ fn check_record(r: &Value) {
         "tools",
         "list_bytes",
     ];
-    let verbs = ["status", "show", "find", "test", "problems", "verbs", "unknown", "stats", "integrate", "ext", "trust", "mcp", "daemon", "use", "stop", "ext_tool"];
+    let verbs = ["status", "show", "find", "test", "problems", "verbs", "unknown", "stats", "integrate", "ext", "trust", "mcp", "daemon", "use", "stop"];
     let errs = [
         "bad_args",
         "unknown_verb",
@@ -1031,9 +1024,6 @@ fn claude_code_lists_itse_over_mcp() {
     let init = env.usage().into_iter().find(|r| r["ev"] == "init").expect("an init record from Claude Code's session");
     eprintln!("negotiated protocol {} with {} {}", init["proto"], init["client"], init["client_v"]);
     assert!(["2025-11-25", "2025-06-18"].contains(&init["proto"].as_str().unwrap()));
-    // list_changed: `claude mcp list` connects once and lists once; whether a session re-lists on
-    // notifications/tools/list_changed needs a model turn (ITSE_E2E_CLAUDE_PROBE), so it is recorded only.
-    eprintln!("list_changed: not observable without a model turn; tools/list calls seen: {}", env.usage().iter().filter(|r| r["ev"] == "init").count());
 }
 
 // --- the manifest, layers, resolver and human-only verbs ---
@@ -1057,17 +1047,7 @@ mod lsp;
 #[path = "e2e/ra.rs"]
 mod ra;
 
-// --- hosted MCP servers ---
-
-#[path = "e2e/mcp.rs"]
-mod mcp;
-
 // --- harness integration and the hook ---
 
 #[path = "e2e/harness.rs"]
 mod harness;
-
-// --- debug adapters ---
-
-#[path = "e2e/dap.rs"]
-mod dap;

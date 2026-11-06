@@ -64,7 +64,7 @@ itse runs this workspace's declared tests, builds and language servers and answe
 
 ## Workspace specifics
 
-`itse verbs` lists this workspace's declared actions, its extensions' notes, and the debug verbs where a debugger is declared.
+`itse verbs` lists this workspace's declared actions and its extensions' notes.
 ",
     ),
 ];
@@ -89,7 +89,7 @@ pub struct Outcome {
     pub scope: String,
     pub counts: String,
     pub cost: Cost,
-    /// `run:14`, `q:88`, `dbg:2`: where the full result is kept.
+    /// `run:14`, `q:88`: where the full result is kept.
     pub id: Option<String>,
     pub items: Vec<Item>,
     pub states: Vec<State>,
@@ -116,7 +116,6 @@ pub enum Verdict {
     Empty,
     Running,
     Stopped,
-    Exited,
     NeedsHuman,
     NeedsConsent,
     Untrusted,
@@ -124,7 +123,7 @@ pub enum Verdict {
     Unready,
 }
 
-/// A located finding: E1 W2 (problems), T3 (tests), S1 (symbols), R4 (references), F1 (frames).
+/// A located finding: E1 W2 (problems), T3 (tests), S1 (symbols) and R4 (references).
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct Item {
     pub id: String,
@@ -285,8 +284,7 @@ pub fn clip(line: &str, max: usize) -> String {
 }
 
 /// A workspace's stored results under its state dir: `results/<n>.json` for queries,
-/// `runs/<n>/result.json` for actions and `debug/<n>/result.json` for debug sessions. Kept: the
-/// newest 200 queries or 512 MiB.
+/// `runs/<n>/result.json` for actions. Kept: the newest 200 queries or 512 MiB.
 pub struct Store(pub PathBuf);
 
 impl Store {
@@ -312,8 +310,6 @@ impl Store {
         match id.split_once(':').filter(|(_, n)| n.parse::<u64>().is_ok())? {
             ("q", n) => Some(self.0.join("results").join(format!("{n}.json"))),
             ("run", n) => Some(self.0.join("runs").join(n).join("result.json")),
-            // A debug session's last snapshot, which outlives the session.
-            ("dbg", n) => Some(self.0.join("debug").join(n).join("result.json")),
             _ => None,
         }
     }

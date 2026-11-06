@@ -30,7 +30,7 @@ pub fn ask(reader: &mut BufReader<UnixStream>, method: &str, params: Value, wait
     let _ = reader.get_ref().set_read_timeout(None);
     match reply {
         Ok(Some(r)) if r["error"].is_object() => {
-            Err(RpcError::Remote { code: r["error"]["code"].as_i64().unwrap_or(0), message: r["error"]["message"].as_str().unwrap_or("").into(), data: None })
+            Err(RpcError::Remote { code: r["error"]["code"].as_i64().unwrap_or(0), message: r["error"]["message"].as_str().unwrap_or("").into() })
         }
         Ok(Some(mut r)) => Ok(r["result"].take()),
         Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => Err(RpcError::Timeout),

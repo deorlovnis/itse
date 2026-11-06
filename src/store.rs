@@ -335,7 +335,8 @@ pub fn clean(dirs: &Dirs) {
 }
 
 /// `gc --keep-locked`: remove the packages and downloads that no lock pins: every repo's machine
-/// lock, and the team lock of every workspace that ever had a daemon. Returns what went.
+/// lock, and the team lock of every workspace that ever had a daemon; and the debug snapshots an
+/// older itse kept in a workspace's state, which nothing reads any more. Returns what went.
 pub fn gc(dirs: &Dirs) -> Result<Vec<String>> {
     let mut locks: Vec<PathBuf> = entries(&dirs.state.join("repo")).map(|(_, p)| p.join("itse.lock.json")).collect();
     locks.extend(entries(&dirs.state.join("ws")).filter_map(|(_, p)| fs::read_to_string(p.join("root")).ok()).map(|r| Path::new(&r).join(".itse/itse.lock.json")));
@@ -351,6 +352,10 @@ pub fn gc(dirs: &Dirs) -> Result<Vec<String>> {
             remove(&path);
             gone.push(name);
         }
+    }
+    for (name, path) in entries(&dirs.state.join("ws")).map(|(n, p)| (format!("{n}/debug"), p.join("debug"))).filter(|(_, p)| p.is_dir()) {
+        remove(&path);
+        gone.push(name);
     }
     Ok(gone)
 }

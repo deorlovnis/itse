@@ -183,6 +183,8 @@ fn stats_groups_by_verb_and_client() {
     log.extend((1..=9).map(|i| rec("s1", "test", json!("gradle"), "claude-code", i * 100, "ok", Value::Null)));
     log.push(rec("s1", "test", json!("gradle"), "claude-code", 5000, "error", json!("server_crash")));
     log.push(rec("s2", "status", Value::Null, "cli", 7, "ok", Value::Null));
+    // An older log's debug attach is neither a call nor a session.
+    log.push(json!({"v":1,"ev":"attach","ts":ts,"ws":"aaaaaaaaaaaa","sess":"s3","outcome":"ok"}));
     log.push(json!({"v":1,"ev":"call","ts":"2020-01-01T00:00:00.000Z","ws":"b","sess":"old","verb":"find","outcome":"ok","ms":1}));
     fs::write(d.state.join("usage.jsonl"), log.iter().map(|l| format!("{l}\n")).collect::<String>()).unwrap();
     let stats = |tokens: &[&str]| super::stats(&d, &verbs::parse_args(verbs::find("stats").unwrap(), tokens.iter().map(OsString::from)).unwrap(), &["test", "status", "outline"]);
@@ -194,7 +196,7 @@ fn stats_groups_by_verb_and_client() {
     assert_eq!(lines[3], "test (gradle)      10  90%  -    10%     500  5,000        200   20.0 MB   100%  100%");
     assert_eq!(lines[4], "connected, never called: 1 of 3 sessions (claude-code 2.1.312)");
     assert_eq!(lines[5], "offered, never called: outline");
-    assert_eq!(lines[6], "errors: server_crash 1 (gradle)");
+    assert_eq!(lines[6..], ["errors: server_crash 1 (gradle)"]);
     let by_client = stats(&["--by", "client", "--since", "2019-12-31"]).unwrap();
     assert!(by_client.contains("\nclaude-code 2.1.312    10  90% "), "{by_client}");
     assert!(by_client.contains("\ncli 2.1.312             1 "), "{by_client}");
