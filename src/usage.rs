@@ -59,7 +59,7 @@ pub enum Event {
     },
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Default, Serialize)]
 pub struct Call {
     /// `cli`, `mcp` or `hook`.
     pub via: &'static str,

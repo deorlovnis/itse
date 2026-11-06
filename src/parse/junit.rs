@@ -99,32 +99,25 @@ pub fn scan(r: impl Read) -> Result<Vec<Case>, u64> {
             }
             None => false,
         };
+        // Checked again, so text that reached the cap before a CDATA section keeps it out.
         if let Some(c) = case.as_mut().filter(|c| keeps(&stack) && c.text.len() < TEXT_CAP) {
             c.text.push_str(&String::from_utf8_lossy(&cdata));
         }
         let tag = String::from_utf8_lossy(&tag).into_owned();
         let name = tag.trim_start_matches('/').split(|c: char| c.is_whitespace() || c == '/').next().unwrap_or("").to_string();
-        if !ok || name.is_empty() && !tag.is_empty() {
+        let close = tag.starts_with('/');
+        if !ok || name.is_empty() && !tag.is_empty() || close && stack.pop() != Some(name.clone()) {
             return Err(s.pos);
-        }
-        if tag.starts_with('/') {
-            if stack.pop() != Some(name.clone()) {
-                return Err(s.pos);
-            }
-            if name == "testcase" {
-                cases.extend(case.take());
-            }
-            continue;
         }
         if name.is_empty() {
             continue;
         }
         root |= name == "testsuite" || name == "testsuites";
         match name.as_str() {
-            "testcase" => {
+            "testcase" if !close => {
                 case = Some(Case { class: attr(&tag, "classname").unwrap_or_default(), name: attr(&tag, "name").unwrap_or_default(), status: "passed", text: String::new() })
             }
-            "failure" | "error" | "skipped" => {
+            "failure" | "error" | "skipped" if !close => {
                 if let Some(c) = case.as_mut().filter(|c| c.status != "failed") {
                     c.status = if name == "skipped" { "skipped" } else { "failed" };
                     c.text = attr(&tag, "message").filter(|_| name != "skipped").map(|m| m + "\n").unwrap_or_default();
@@ -132,11 +125,7 @@ pub fn scan(r: impl Read) -> Result<Vec<Case>, u64> {
             }
             _ => {}
         }
-        if s.before == b'/' {
-            cases.extend((name == "testcase").then(|| case.take()).flatten());
-        } else {
-            stack.push(name);
-        }
+        if close || s.before == b'/' { cases.extend((name == "testcase").then(|| case.take()).flatten()) } else { stack.push(name) }
     }
     if !stack.is_empty() || !root { Err(s.pos) } else { Ok(cases) }
 }
@@ -186,22 +175,21 @@ pub fn reports(root: &Path, glob: &str, started: SystemTime, a: &Action, index: 
     let fresh: Vec<&(String, SystemTime)> = files.iter().filter(|(_, t)| *t + Duration::from_secs(1) >= started).collect();
     let dir = |p: &str| p.rsplit_once('/').map_or(String::new(), |(d, _)| d.to_string());
     let newest = files.iter().max_by_key(|(_, t)| *t).map(|(p, _)| dir(p));
-    let stale = fresh.is_empty() && !files.is_empty();
-    let read = if stale { files.iter().filter(|(p, _)| Some(dir(p)) == newest).collect() } else { fresh };
-    let note = if stale { format!("reports: {} files, report written before this run", read.len()) } else { format!("reports: {} files written by this run", read.len()) };
-    out.notes.extend((!files.is_empty()).then_some(note));
+    let (read, when) =
+        if fresh.is_empty() { (files.iter().filter(|(p, _)| Some(dir(p)) == newest).collect(), ", report written before this run") } else { (fresh, " written by this run") };
+    out.notes.extend((!files.is_empty()).then(|| format!("reports: {} files{when}", read.len())));
     for (path, _) in read {
+        let unparsed = |at| Item { kind: "error".into(), msg: format!("unparsed report {path} at byte {at}"), sources: vec!["junit-xml".into()], ..Item::default() };
         let cases = match File::open(root.join(path)).map_err(|_| 0).and_then(scan) {
             Ok(cases) => cases,
             Err(at) => {
-                out.items.push(Item { kind: "error".into(), msg: format!("unparsed report {path} at byte {at}"), sources: vec!["junit-xml".into()], ..Item::default() });
+                out.items.push(unparsed(at));
                 continue;
             }
         };
         let sum = out.counts.get_or_insert([0; 3]);
         for c in cases {
-            let i = ["passed", "failed", "skipped"].iter().position(|s| *s == c.status).unwrap_or(0);
-            sum[i] += 1;
+            sum[["passed", "failed", "skipped"].iter().position(|s| *s == c.status).unwrap_or(0)] += 1;
             if c.status == "failed" {
                 let (detail, loc, cut) = trace::trim(&c.text, &c.class, a.frames.as_ref(), &a.classify, index);
                 out.notes.extend(cut.then(|| format!("index_truncated: more than {} files; some frames are unlocated", trace::INDEX_CAP)));

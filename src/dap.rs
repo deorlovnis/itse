@@ -13,7 +13,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpStream};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Component, Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::Child;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant, SystemTime};
@@ -23,7 +23,7 @@ use anyhow::{Context, Result, anyhow, bail, ensure};
 use regex_lite::Regex;
 use serde_json::{Value, json};
 
-use crate::host::{self, Host, Launch, Next, Protocol};
+use crate::host::{self, Host, Launch, Protocol};
 use crate::manifest::{DapVia, render_value};
 use crate::resolve::{self, Resolved};
 use crate::results::{Cost, Item, Outcome, State, Store, Verdict, clip};
@@ -57,13 +57,17 @@ const FAILED: &str = "is not running: its start failed";
 /// apart, since an adapter just spawned may not listen yet. Names are refused too: a name could
 /// resolve anywhere, and resolving one is a socket of its own.
 pub fn connect_loopback(host: &str, port: u16, tries: u32) -> Result<TcpStream> {
-    let ip = host.trim_start_matches('[').trim_end_matches(']').parse::<IpAddr>().ok();
-    let Some(ip) = ip.filter(|ip| *ip == IpAddr::V4(Ipv4Addr::LOCALHOST) || *ip == IpAddr::V6(Ipv6Addr::LOCALHOST)) else {
-        bail!("{host} is not 127.0.0.1 or ::1; itse connects to debug adapters on loopback only");
-    };
+    let ip = loopback(host)?;
     let connect = || TcpStream::connect_timeout(&SocketAddr::new(ip, port), Duration::from_millis(100));
     let early = (1..tries).find_map(|_| connect().inspect_err(|_| thread::sleep(Duration::from_millis(100))).ok());
     early.map_or_else(connect, Ok).with_context(|| format!("connecting to {host} port {port}"))
+}
+
+/// `host` as an address if it is the literal 127.0.0.1 or ::1.
+fn loopback(host: &str) -> Result<IpAddr> {
+    let ip = host.trim_start_matches('[').trim_end_matches(']').parse::<IpAddr>().ok();
+    ip.filter(|ip| *ip == IpAddr::V4(Ipv4Addr::LOCALHOST) || *ip == IpAddr::V6(Ipv6Addr::LOCALHOST))
+        .ok_or_else(|| anyhow!("{host} is not 127.0.0.1 or ::1; itse connects to debug adapters on loopback only"))
 }
 
 /// Where an LSP command's debug server listens, or an `attach` address: `5005`, `"5005"`,
@@ -148,10 +152,10 @@ fn named(arg: &str) -> Option<(&str, &str)> {
 /// newest stored result whose scope starts with `tests`, in place of a logpoint there; else caught
 /// exceptions in `packages`, else in the prefixes that result's test names give, else in project code.
 fn rule(root: &Path, cwd: &Path, store: &Store, args: &Args, tests: Option<&str>, packages: &[String]) -> Result<Rule> {
-    let (mut r, mut at, flag) = (Rule::default(), Vec::new(), |k: &str| args.flags.get(k).and_then(Value::as_array).cloned().unwrap_or_default());
-    let (ats, logs) = (flag("at"), flag("log"));
-    let logs = logs.iter().filter_map(Value::as_str).map(|l| l.split_once('=').filter(|(_, t)| !t.is_empty()).ok_or_else(|| anyhow!("'{l}' is not path:line=text")));
-    for spec in ats.iter().filter_map(Value::as_str).map(|a| Ok((a, ""))).chain(logs) {
+    let (mut r, mut at) = (Rule::default(), Vec::new());
+    let flag = |k: &str| args.flags.get(k).and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str);
+    let logs = flag("log").map(|l| l.split_once('=').filter(|(_, t)| !t.is_empty()).ok_or_else(|| anyhow!("'{l}' is not path:line=text")));
+    for spec in flag("at").map(|a| Ok((a, ""))).chain(logs) {
         let (spec, log) = spec?;
         let (path, line) = spec.rsplit_once(':').and_then(|(p, n)| Some((p, n.parse::<u64>().ok()?))).ok_or_else(|| anyhow!("'{spec}' is not path:line"))?;
         let file = [cwd.join(path), root.join(path)].into_iter().find(|p| p.is_file()).ok_or_else(|| anyhow!("{path}: no such file"))?;
@@ -164,7 +168,8 @@ fn rule(root: &Path, cwd: &Path, store: &Store, args: &Args, tests: Option<&str>
         r.text = format!("breakpoints at {}", at.join(", "));
         return Ok(r);
     }
-    let (name, newest) = (args.rest.iter().find_map(|a| named(a)), tests.and_then(|t| newest(store, t)));
+    let name = args.rest.iter().find_map(|a| named(a));
+    let newest = tests.and_then(|t| store.runs().iter().filter_map(|n| Some(store.load(&format!("run:{n}")).ok()?.0)).find(|o| o.verb == "test" && o.scope.starts_with(t)));
     let failed = match name {
         Some((id, item)) => Some(store.load(id)?.0.items.into_iter().find(|i| i.id == item).ok_or_else(|| anyhow!("{id} holds no {item}"))?),
         None => newest.iter().flat_map(|o| &o.items).find(|i| i.kind == "failed").cloned(),
@@ -182,13 +187,6 @@ fn rule(root: &Path, cwd: &Path, store: &Store, args: &Args, tests: Option<&str>
     r.text = format!("caught exceptions in {}", if caught.is_empty() { "project code".into() } else { caught.join(", ") });
     r.caught = Some(caught);
     Ok(r)
-}
-
-/// The newest stored test result whose scope starts with `tests`.
-fn newest(store: &Store, tests: &str) -> Option<Outcome> {
-    let mut runs: Vec<u64> = fs::read_dir(store.0.join("runs")).into_iter().flatten().flatten().filter_map(|e| e.file_name().to_str()?.parse().ok()).collect();
-    runs.sort_unstable();
-    runs.iter().rev().filter_map(|n| Some(store.load(&format!("run:{n}")).ok()?.0)).find(|o| o.verb == "test" && o.scope.starts_with(tests))
 }
 
 /// The class or module prefixes test names give, as frames name the code: `orders::tests::saves`
@@ -226,6 +224,16 @@ fn marker(handle: &str) -> String {
     format!("{}-{handle}", std::process::id())
 }
 
+/// Session `dbg:N`'s folder, `debug/<N>`: its adapter's log, its snapshots and how it ended.
+fn folder(state: &Path, handle: &str) -> PathBuf {
+    state.join("debug").join(&handle[4..])
+}
+
+/// The folder of `handle` if it names a session that was started here.
+fn known(state: &Path, handle: &str) -> Option<PathBuf> {
+    handle.strip_prefix("dbg:").filter(|n| n.parse::<u64>().is_ok()).map(|n| state.join("debug").join(n)).filter(|d| d.is_dir())
+}
+
 /// What a session holds besides its stream: the adapter's process when it spawned one, its socket
 /// over TCP, and the LSP server that serves it, held so that server's idle stop leaves it be.
 #[derive(Default)]
@@ -243,24 +251,6 @@ fn tcp(s: TcpStream, ends: Ends) -> Result<Stream> {
     Ok((Box::new(BufReader::new(s.try_clone()?)), Box::new(s.try_clone()?), Ends { tcp: Some(s), ..ends }))
 }
 
-/// Spawn an adapter in its own group, marked, in `procs.json` as the session's handle, stderr
-/// (and, off stdio, stdout) appended to `log`.
-fn spawn(host: &Host, l: &Launch, argv: &[String], handle: &str, log: &Path, env: &BTreeMap<String, String>, stdio: bool) -> Result<Child> {
-    let (program, args) = argv.split_first().ok_or_else(|| anyhow!("{} has no command", l.id))?;
-    let file = fs::OpenOptions::new().create(true).append(true).mode(0o600).open(log)?;
-    let mut cmd = Command::new(program);
-    cmd.args(args).current_dir(&l.cwd).env_clear().envs(env).envs(l.env.iter().cloned()).env(host::MARKER, marker(handle)).stderr(file.try_clone()?);
-    let (input, output) = if stdio { (Stdio::piped(), Stdio::piped()) } else { (Stdio::null(), Stdio::from(file)) };
-    cmd.stdin(input).stdout(output);
-    let child = host::spawn(&mut cmd, &l.limits, false, 800).map_err(|e| anyhow!("starting {program}: {e}"))?;
-    let (pid, at) = (child.id() as i32, sys::utc(SystemTime::now()));
-    let start_time = sys::proc_stat(pid).map_or(0, |s| s.start_time);
-    let record =
-        json!({"handle": handle, "kind": "dap", "pid": pid, "pgid": pid, "start_time": start_time, "argv0": program, "started_at": at, "log": log, "marker": marker(handle)});
-    host.track(handle, Some(record));
-    Ok(child)
-}
-
 /// Reach the adapter as its `via` says: spawned on stdio; spawned, then connected to its declared
 /// port (free before the spawn, else this would reach whatever holds it); or connected to the port
 /// its LSP server's command answers with. Loopback only.
@@ -268,21 +258,19 @@ fn spawn(host: &Host, l: &Launch, argv: &[String], handle: &str, log: &Path, env
 fn open(host: &Arc<Host>, r: &Resolved, caller: &Caller, l: &Launch, handle: &str, log: &Path, env: &BTreeMap<String, String>, cancel: &Cancel) -> Result<Stream> {
     match l.via.as_ref().unwrap_or(&DapVia::Program) {
         DapVia::Program => {
-            let mut child = spawn(host, l, &l.argv, handle, log, env, true)?;
+            let mut child = host.spawn_as(handle, "dap", l, &l.argv, env, log, &marker(handle), true)?.0;
             let (Some(out), Some(input)) = (child.stdout.take(), child.stdin.take()) else { bail!("{} has no stdio", l.id) };
             Ok((Box::new(BufReader::new(out)), Box::new(input), Ends { child: Some(Mutex::new(child)), ..Ends::default() }))
         }
         DapVia::Tcp { argv, port } => {
             ensure!(!listening(*port), "port {port} is taken already (by another debug session?), so {} can't listen there", l.id);
-            let mut child = spawn(host, l, argv, handle, log, env, false)?;
-            let pid = child.id() as i32;
-            let connected = connect_loopback("127.0.0.1", *port, 50).inspect_err(|_| host::kill_tree(pid, &marker(handle), || drop(child.try_wait())));
-            tcp(connected.inspect_err(|_| host.untrack(handle, pid))?, Ends { child: Some(Mutex::new(child)), ..Ends::default() })
+            let mut child = host.spawn_as(handle, "dap", l, argv, env, log, &marker(handle), false)?.0;
+            let connected = connect_loopback("127.0.0.1", *port, 50).inspect_err(|_| drop(host.kill_child(handle, &mut child, &marker(handle))));
+            tcp(connected?, Ends { child: Some(Mutex::new(child)), ..Ends::default() })
         }
         DapVia::LspCommand { server, command, arguments } => {
-            let filetypes = r.launches.iter().find(|x| x.protocol == Protocol::Lsp && x.id == *server).map(|x| x.filetypes.clone());
-            let filetypes = filetypes.ok_or_else(|| anyhow!("lsp:{server} is not ready; itse status shows why"))?;
-            let asks = lsp::servers(host, &caller.env, "debug", "", &|f| f == filetypes.as_slice(), true, cancel).map_err(|o| anyhow!("{}", o.head()))?;
+            let lsp = r.launches.iter().find(|x| x.protocol == Protocol::Lsp && x.id == *server).ok_or_else(|| anyhow!("lsp:{server} is not ready; itse status shows why"))?;
+            let asks = lsp::servers(host, &caller.env, "debug", "", &|f| f == lsp.filetypes.as_slice(), true, cancel).map_err(|o| anyhow!("{}", o.head()))?;
             let ask = asks.asks.into_iter().find(|a| a.launch.id == *server).ok_or_else(|| anyhow!("lsp:{server} is not running"))?;
             let answer = ask.request("workspace/executeCommand", json!({"command": command, "arguments": arguments}), cancel)?;
             let s = address(&answer).and_then(|(h, port)| connect_loopback(&h, port, 50)).with_context(|| format!("lsp:{server}'s {command} answered {answer}"))?;
@@ -303,22 +291,29 @@ pub struct Session {
     root: PathBuf,
     state: PathBuf,
     hide: Vec<Regex>,
-    /// The stopped thread, the last snapshot, the snapshots taken, the last use.
-    at: Mutex<(i64, Value, u32, Instant)>,
-    /// A stop not come by the call's wait, which `debug snapshot` waits for: Some(plain), whether a
-    /// plain caught filter's framework stops are skipped on the way.
-    pending: Mutex<Option<bool>>,
+    at: Mutex<At>,
     ended: AtomicBool,
-    /// What started it, for status, and the adapter's log, kept under 4 MiB.
+    /// What started it, for status.
     scope: String,
-    log: PathBuf,
 }
 
-/// What a wait for a stop came to: the `stopped` body, how the debuggee ended, or nothing yet.
+/// Where a session is: the stopped thread, the last snapshot, the snapshots taken, the last use,
+/// and a stop not come by the call's wait, which `debug snapshot` waits for: Some(plain), whether
+/// a plain caught filter's framework stops are skipped on the way.
+struct At {
+    thread: i64,
+    last: Value,
+    taken: u32,
+    used: Instant,
+    pending: Option<bool>,
+}
+
+/// What a wait for a stop came to: the `stopped` body, how the debuggee ended, or nothing yet
+/// (and whether the wait skips a plain caught filter's framework stops).
 enum Stop {
     At(Value),
     Over(String),
-    Pending,
+    Pending(bool),
 }
 
 /// `cap`, or what is left until `until` if less.
@@ -381,36 +376,33 @@ impl Session {
         let end = Instant::now() + wait;
         while self.next(&["initialized"], TICK, cancel).is_none() {
             early = early.or_else(|| answer.try_recv().ok());
-            if matches!(early, Some(Err(_))) {
-                break;
+            if let Some(Err(e)) = early {
+                return Err(self.failed(request, e));
             }
             self.alive(cancel)?;
             ensure!(Instant::now() < end, "no initialized event in {} s", wait.as_secs());
         }
+        let logs = caps["supportsLogPoints"] == true;
+        for (path, bps) in &rule.lines {
+            let rel = path.strip_prefix(&self.root).unwrap_or(path).display();
+            let kept: Vec<&Value> = bps.iter().filter(|b| logs || b.get("logMessage").is_none()).collect();
+            notes.extend((!path.is_file()).then(|| format!("{rel}: no such file")));
+            notes.extend((kept.len() < bps.len()).then(|| format!("{rel}: logpoints dropped, as the adapter has none")));
+            let set = self.soft("setBreakpoints", json!({"source": {"path": path}, "breakpoints": kept}), cancel)?.map_err(|e| notes.push(e)).unwrap_or_default();
+            let unverified = set["breakpoints"].as_array().into_iter().flatten().zip(&kept).filter(|(b, _)| b["verified"] == false);
+            notes.extend(unverified.map(|(b, bp)| format!("{rel}:{} unverified{}", bp["line"], b["message"].as_str().map_or(String::new(), |m| format!(" ({m})")))));
+        }
         let (exceptions, mut plain) = rule.exceptions(&caps, condition);
-        if !matches!(early, Some(Err(_))) {
-            let logs = caps["supportsLogPoints"] == true;
-            for (path, bps) in &rule.lines {
-                let rel = path.strip_prefix(&self.root).unwrap_or(path).display();
-                let dropped = !logs && bps.iter().any(|b| b.get("logMessage").is_some());
-                let missing = (!path.is_file()).then(|| format!("{rel}: no such file"));
-                notes.extend(missing.into_iter().chain(dropped.then(|| format!("{rel}: logpoints dropped, as the adapter has none"))));
-                let bps: Vec<&Value> = bps.iter().filter(|b| logs || b.get("logMessage").is_none()).collect();
-                let set = self.soft("setBreakpoints", json!({"source": {"path": path}, "breakpoints": bps}), cancel)?.map_err(|e| notes.push(e)).unwrap_or_default();
-                let unverified = set["breakpoints"].as_array().into_iter().flatten().zip(&bps).filter(|(b, _)| b["verified"] == false);
-                notes.extend(unverified.map(|(b, bp)| format!("{rel}:{} unverified{}", bp["line"], b["message"].as_str().map_or(String::new(), |m| format!(" ({m})")))));
+        match self.soft("setExceptionBreakpoints", exceptions.clone(), cancel)? {
+            Err(e) if exceptions.get("filterOptions").is_some() => {
+                let (exceptions, p) = rule.exceptions(&caps, None);
+                (plain, _) = (p, notes.push(format!("{e}, so the plain caught filter, its stops outside the project skipped")));
+                notes.extend(self.soft("setExceptionBreakpoints", exceptions, cancel)?.err());
             }
-            match self.soft("setExceptionBreakpoints", exceptions.clone(), cancel)? {
-                Err(e) if exceptions.get("filterOptions").is_some() => {
-                    let (exceptions, p) = rule.exceptions(&caps, None);
-                    (plain, _) = (p, notes.push(format!("{e}, so the plain caught filter, its stops outside the project skipped")));
-                    notes.extend(self.soft("setExceptionBreakpoints", exceptions, cancel)?.err());
-                }
-                set => notes.extend(set.err()),
-            }
-            if caps["supportsConfigurationDoneRequest"] == true {
-                self.request("configurationDone", json!({}), ASK, cancel)?;
-            }
+            set => notes.extend(set.err()),
+        }
+        if caps["supportsConfigurationDoneRequest"] == true {
+            self.request("configurationDone", json!({}), ASK, cancel)?;
         }
         let wait = left(until, LAUNCH);
         let end = Instant::now() + wait;
@@ -446,19 +438,23 @@ impl Session {
         self.request(cmd, args, ASK, cancel)
     }
 
-    /// The next stop by `until`, else how the debuggee ended, in words; a step of `thread` skips
-    /// another thread's own stop. The `threadId` is optional (all threads stopped): the first
-    /// thread's then.
-    fn wait_stop(&self, until: Instant, thread: Option<i64>, cancel: &Cancel) -> Result<Stop> {
+    /// The next stop by `until` that the rule keeps, else how the debuggee ended, in words; and how
+    /// many stops were skipped. A step of `thread` skips another thread's own stop. The `threadId`
+    /// is optional (all threads stopped): the first thread's then. On a `plain` caught filter, a
+    /// caught exception (as `exceptionInfo`'s break mode tells, where offered) whose top frame isn't
+    /// the project's is continued, 20 times at most; a stop these requests fail on is kept.
+    fn wait_stop(&self, until: Instant, thread: Option<i64>, plain: bool, cancel: &Cancel) -> Result<(Stop, usize)> {
+        let mut skipped = 0;
         loop {
             let Some((event, mut body)) = self.next(&["stopped", "terminated", "exited"], left(until, IDLE), cancel) else {
                 self.alive(cancel)?;
-                return Ok(Stop::Pending);
+                return Ok((Stop::Pending(plain), skipped));
             };
             if event != "stopped" {
                 let output: Vec<String> = lock(&self.events.q).1.iter().rev().take(3).rev().cloned().collect();
                 let code = body["exitCode"].as_i64().map_or(String::new(), |c| format!(" with exit code {c}"));
-                return Ok(Stop::Over(format!("the debuggee ended{code}{}", if output.is_empty() { String::new() } else { format!("; output: {}", output.join(" | ")) })));
+                let output = if output.is_empty() { String::new() } else { format!("; output: {}", output.join(" | ")) };
+                return Ok((Stop::Over(format!("the debuggee ended{code}{output}")), skipped));
             }
             if thread.is_some_and(|t| body["threadId"].as_i64().is_some_and(|b| b != t)) && body["allThreadsStopped"] != true {
                 continue;
@@ -466,64 +462,50 @@ impl Session {
             if body["threadId"].is_null() {
                 body["threadId"] = self.request("threads", json!({}), ASK, cancel)?["threads"][0]["id"].clone();
             }
-            return Ok(Stop::At(body));
-        }
-    }
-
-    /// Run to the first stop the rule keeps: on a plain caught filter, a caught exception (as
-    /// `exceptionInfo`'s break mode tells, where offered) whose top frame isn't the project's is
-    /// continued, 20 times at most; a stop these requests fail on is kept. The stop, how the
-    /// debuggee ended, or nothing by `until`; and how many stops were skipped.
-    fn first_stop(&self, plain: bool, until: Instant, cancel: &Cancel) -> Result<(Stop, usize)> {
-        let mut skipped = 0;
-        loop {
-            let stop = match self.wait_stop(until, None, cancel)? {
-                Stop::At(stop) => stop,
-                other => return Ok((other, skipped)),
-            };
-            let (thread, ask) = (&stop["threadId"], |cmd: &str, args: Value| self.request(cmd, args, ASK, cancel));
-            let uncaught = || self.can("supportsExceptionInfoRequest") && ask("exceptionInfo", json!({"threadId": thread})).is_ok_and(|i| i["breakMode"] != "always");
-            let ours = || ask("stackTrace", json!({"threadId": thread, "levels": 1})).map_or(true, |t| project(&self.root, &t["stackFrames"][0]).is_some());
-            if !plain || stop["reason"] != "exception" || skipped >= SKIPS || uncaught() || ours() {
-                return Ok((Stop::At(stop), skipped));
+            let (id, ask) = (&body["threadId"], |cmd: &str, args: Value| self.request(cmd, args, ASK, cancel));
+            let uncaught = || self.can("supportsExceptionInfoRequest") && ask("exceptionInfo", json!({"threadId": id})).is_ok_and(|i| i["breakMode"] != "always");
+            let ours = || ask("stackTrace", json!({"threadId": id, "levels": 1})).map_or(true, |t| project(&self.root, &t["stackFrames"][0]).is_some());
+            if !plain || body["reason"] != "exception" || skipped >= SKIPS || uncaught() || ours() {
+                return Ok((Stop::At(body), skipped));
             }
-            self.resume("continue", json!({"threadId": thread}), cancel)?;
+            self.resume("continue", json!({"threadId": id}), cancel)?;
             skipped += 1;
         }
     }
 
     /// What a wait for a stop answers: the snapshot at it; EXITED, the session ended; or RUNNING,
-    /// kept for `debug snapshot` to wait on (with `plain` for its skips). `rule` is a start's.
+    /// kept for `debug snapshot` to wait on. `rule` is a start's.
     #[allow(clippy::too_many_arguments)]
-    fn settle(&self, host: &Host, caller: &Caller, scope: &str, stop: Stop, plain: bool, rule: Option<&str>, frame: usize, cancel: &Cancel) -> Result<Outcome> {
-        *lock(&self.pending) = matches!(stop, Stop::Pending).then_some(plain);
-        let cost = Cost { ms: lock(&self.at).3.elapsed().as_millis() as u64, warm: None };
+    fn settle(&self, host: &Host, caller: &Caller, scope: &str, stop: Stop, rule: Option<&str>, frame: usize, cancel: &Cancel) -> Result<Outcome> {
+        let mut at = lock(&self.at);
+        at.pending = if let Stop::Pending(plain) = stop { Some(plain) } else { None };
+        let ms = at.used.elapsed().as_millis() as u64;
+        drop(at);
         let on = rule.map_or(String::new(), |r| format!(" (stop on: {r})"));
-        let counts = match stop {
+        let (verdict, counts) = match stop {
             Stop::At(stop) => return self.answer(caller, scope, &stop, rule, frame, cancel),
             Stop::Over(over) => (Verdict::Exited, if rule.is_some() { format!("no stop{on}; {over}") } else { over }),
-            Stop::Pending => (Verdict::Running, format!("no stop yet{on}; 'itse debug snapshot {}' waits for it", self.handle)),
+            Stop::Pending(_) => (Verdict::Running, format!("no stop yet{on}; 'itse debug snapshot {}' waits for it", self.handle)),
         };
-        let id = (counts.0 == Verdict::Running).then(|| self.handle.clone());
-        if counts.0 == Verdict::Exited {
+        if verdict == Verdict::Exited {
             self.end(host, "has ended");
         }
-        Ok(Outcome { cost, id, ..Outcome::new("debug", counts.0, scope, counts.1) })
+        let id = (verdict == Verdict::Running).then(|| self.handle.clone());
+        Ok(Outcome { cost: Cost { ms, warm: None }, id, ..Outcome::new("debug", verdict, scope, counts) })
     }
 
     /// The stopped thread at most 50 requests deep (5 s each, 10 s in all): its project frames
     /// (the rest counted), their source windows, the variables of the top three, the exception and
     /// the last output; `cut` when the budget ran out or a request failed. Names are clipped too.
     fn snapshot(&self, thread: i64, reason: &str, cancel: &Cancel) -> Result<Value> {
-        let (left, end, lost) = (Cell::new(ASKS), Instant::now() + SNAP, Cell::new(false));
+        let (budget, end, lost) = (Cell::new(ASKS), Instant::now() + SNAP, Cell::new(false));
         let ask = |cmd: &str, args: Value| -> Result<Value> {
-            let wait = end.saturating_duration_since(Instant::now()).min(ASK);
-            ensure!(left.get() > 0 && !wait.is_zero(), "the snapshot's budget is spent");
-            left.set(left.get() - 1);
+            let wait = left(end, ASK);
+            ensure!(budget.get() > 0 && !wait.is_zero(), "the snapshot's budget is spent");
+            budget.set(budget.get() - 1);
             self.request(cmd, args, wait, cancel).inspect_err(|_| lost.set(true))
         };
-        let threads = ask("threads", json!({}))?;
-        let name = threads["threads"].as_array().into_iter().flatten().find(|t| t["id"] == thread).map_or("", |t| t["name"].as_str().unwrap_or(""));
+        let name = clip(ask("threads", json!({}))?["threads"].as_array().into_iter().flatten().find(|t| t["id"] == thread).map_or("", |t| t["name"].as_str().unwrap_or("")), 160);
         let all = ask("stackTrace", json!({"threadId": thread, "startFrame": 0, "levels": 40}))?["stackFrames"].as_array().cloned().unwrap_or_default();
         let mut frames = Vec::new();
         for f in &all {
@@ -540,9 +522,8 @@ impl Session {
             frames.push(frame);
         }
         let exception = (reason == "exception" && self.can("supportsExceptionInfoRequest")).then(|| ask("exceptionInfo", json!({"threadId": thread})).ok());
-        let output: Vec<String> = lock(&self.events.q).1.iter().cloned().collect();
-        let cut = lost.get() || left.get() == 0 || Instant::now() >= end;
-        let thread = json!({"id": thread, "name": clip(name, 160)});
+        let cut = lost.get() || budget.get() == 0 || Instant::now() >= end;
+        let (thread, output) = (json!({"id": thread, "name": name}), lock(&self.events.q).1.clone());
         Ok(json!({"reason": reason, "thread": thread, "frames": frames, "framework": all.len() - frames.len(), "exception": exception.flatten(), "output": output, "cut": cut}))
     }
 
@@ -567,21 +548,18 @@ impl Session {
     /// shows. Its cost is the time since the call began, which `at` holds. An adapter that ended
     /// meanwhile leaves the session gone, not a snapshot that looks whole.
     fn answer(&self, caller: &Caller, scope: &str, stop: &Value, rule: Option<&str>, frame: usize, cancel: &Cancel) -> Result<Outcome> {
-        let thread = stop["threadId"].as_i64().unwrap_or(lock(&self.at).0);
-        let snap = self.snapshot(thread, stop["reason"].as_str().unwrap_or("pause"), cancel)?;
+        let (thread, reason) = (stop["threadId"].as_i64().unwrap_or(lock(&self.at).thread), stop["reason"].as_str().unwrap_or("pause"));
+        let snap = self.snapshot(thread, reason, cancel)?;
         self.alive(cancel)?;
         let shown = frame_at(&snap, frame)?["name"].as_str().map(|n| if frame > 0 { format!("F{} {n}", frame + 1) } else { n.into() });
         let mut at = lock(&self.at);
-        let (k, ms) = (at.2 + 1, at.3.elapsed().as_millis() as u64);
-        *at = (thread, snap.clone(), k, Instant::now());
+        let (k, ms) = (at.taken + 1, at.used.elapsed().as_millis() as u64);
+        (at.thread, at.last, at.taken, at.used) = (thread, snap.clone(), k, Instant::now());
         drop(at);
-        let file = self.state.join("debug").join(&self.handle[4..]).join(format!("s{k}.json"));
+        let file = folder(&self.state, &self.handle).join(format!("s{k}.json"));
         sys::write_atomic(&file, snap.to_string().as_bytes())?;
         let (body, cut) = text(&snap, frame);
-        let reason = match snap["reason"].as_str().unwrap_or("") {
-            "step" => "after a step",
-            r => r,
-        };
+        let reason = if reason == "step" { "after a step" } else { reason };
         let rule = rule.map_or(String::new(), |r| format!("; stop on: {r}"));
         let counts = format!("{reason} in {}, thread {}{rule}", shown.as_deref().unwrap_or("a frame outside the project"), snap["thread"]["name"]);
         // One note, so the page cap never splits it: the text is capped already.
@@ -603,11 +581,7 @@ impl Session {
             let _ = self.peer.request("disconnect", json!({"terminateDebuggee": self.launch}), Duration::from_secs(3), &Cancel::default());
         }
         if let Some(child) = &self.ends.child {
-            let mut child = lock(child);
-            let pid = child.id() as i32;
-            host::kill_tree(pid, &marker(&self.handle), || drop(child.try_wait()));
-            let _ = child.wait();
-            host.untrack(&self.handle, pid);
+            let _ = host.kill_child(&self.handle, &mut lock(child), &marker(&self.handle));
         }
         let _ = self.ends.tcp.as_ref().map(|t| t.shutdown(Shutdown::Both));
         lock(&host.debug).remove(&self.handle);
@@ -638,8 +612,7 @@ fn text(snap: &Value, f: usize) -> (String, bool) {
     if let Some(path) = fr["path"].as_str() {
         let line = fr["line"].as_u64().unwrap_or(0);
         head.push(format!("{path}:{line}:{}", fr["col"].as_u64().unwrap_or(1)));
-        let src = list(&fr["src"]).iter().map(|s| (s[0].as_u64().unwrap_or(0), s[1].as_str().unwrap_or("").to_string())).collect::<Vec<_>>();
-        head.extend(src.iter().map(|(n, t)| format!("{}{n:>4} | {t}", if *n == line { "  >" } else { "   " })));
+        head.extend(list(&fr["src"]).iter().map(|s| format!("{}{:>4} | {}", if s[0] == line { "  >" } else { "   " }, s[0].as_u64().unwrap_or(0), s[1].as_str().unwrap_or(""))));
     }
     let locals = |children: bool| {
         let mut out = Vec::new();
@@ -692,7 +665,7 @@ fn gone(state: &Path, handle: &str, why: &str) -> String {
 /// daemon; the first word kept stays. Its last snapshot, as `itse show` shows it, says so too, and
 /// offers no more steps.
 fn mark(state: &Path, handle: &str, why: &str) {
-    let file = fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(state.join("debug").join(&handle[4..]).join("ended"));
+    let file = fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(folder(state, handle).join("ended"));
     let (store, kept) = (Store(state.into()), file.and_then(|mut f| f.write_all(why.as_bytes())).is_ok());
     if let Some((mut o, session)) = store.load(handle).ok().filter(|_| kept) {
         (o.verdict, o.counts) = (Verdict::Exited, format!("{handle} {why}; its last stop: {}", o.counts));
@@ -705,11 +678,10 @@ fn mark(state: &Path, handle: &str, why: &str) {
 /// that the daemon that held it is gone, is an error.
 fn session(host: &Host, handle: &str) -> Result<Arc<Session>> {
     let (live, state) = (lock(&host.debug).get(handle).cloned(), host.ws.state_dir(&host.dirs));
-    let dir = handle.strip_prefix("dbg:").filter(|n| n.parse::<u64>().is_ok()).map(|n| state.join("debug").join(n)).filter(|d| d.is_dir());
     if let Some(s) = live.as_ref().filter(|s| s.lost().is_none()) {
         return Ok(s.clone());
     }
-    let why = match (&live, dir) {
+    let why = match (&live, known(&state, handle)) {
         (Some(s), _) => s.lost().unwrap_or_default(),
         (None, Some(dir)) => fs::read_to_string(dir.join("ended")).unwrap_or_else(|_| "is gone: daemon restarted".into()),
         (None, None) => "is not running".into(),
@@ -721,13 +693,12 @@ fn session(host: &Host, handle: &str) -> Result<Arc<Session>> {
 /// `stop dbg:N` and `debug stop dbg:N`: `disconnect`, then the adapter is stopped. A session that
 /// ended already is nothing to stop.
 pub fn stop(host: &Host, verb: &str, handle: &str) -> Outcome {
-    let known = handle.strip_prefix("dbg:").filter(|n| n.parse::<u64>().is_ok()).is_some_and(|n| host.ws.state_dir(&host.dirs).join("debug").join(n).is_dir());
     match session(host, handle) {
         Ok(s) => {
             s.end(host, "is stopped");
             Outcome::new(verb, Verdict::Stopped, handle, "stopped")
         }
-        Err(e) if known => Outcome::new(verb, Verdict::Ok, handle, format!("nothing to stop: {e:#}")),
+        Err(e) if known(&host.ws.state_dir(&host.dirs), handle).is_some() => Outcome::new(verb, Verdict::Ok, handle, format!("nothing to stop: {e:#}")),
         Err(e) => Outcome::error(verb, "unknown_id", format!("{e:#}")),
     }
 }
@@ -736,14 +707,13 @@ pub fn stop(host: &Host, verb: &str, handle: &str) -> Outcome {
 /// in seconds, else), is ended on a thread of its own.
 pub fn reap(host: &Arc<Host>) {
     let idle = std::env::var("ITSE_DEBUG_IDLE_S").ok().and_then(|s| s.parse().ok()).map_or(IDLE, Duration::from_secs);
+    let span = if idle.as_secs().is_multiple_of(60) { format!("{} minutes", idle.as_secs() / 60) } else { format!("{} s", idle.as_secs()) };
     let mut all = lock(&host.debug);
-    for s in all.values().filter(|s| fs::metadata(&s.log).is_ok_and(|m| m.len() > host::MAX_LOG)) {
+    for log in all.values().map(|s| folder(&s.state, &s.handle).join("adapter.log")).filter(|l| fs::metadata(l).is_ok_and(|m| m.len() > host::MAX_LOG)) {
         // Its stderr is opened to append, so the adapter writes on at the new end.
-        let _ = fs::OpenOptions::new().write(true).open(&s.log).and_then(|f| f.set_len(0));
+        let _ = fs::OpenOptions::new().write(true).open(log).and_then(|f| f.set_len(0));
     }
-    let done: Vec<String> = all.iter().filter(|(_, s)| s.peer.closed().is_some() || lock(&s.at).3.elapsed() >= idle).map(|(h, _)| h.clone()).collect();
-    for s in done.iter().filter_map(|h| all.remove(h)) {
-        let span = if idle.as_secs().is_multiple_of(60) { format!("{} minutes", idle.as_secs() / 60) } else { format!("{} s", idle.as_secs()) };
+    for (_, s) in all.extract_if(.., |_, s| s.peer.closed().is_some() || lock(&s.at).used.elapsed() >= idle) {
         let (host, why) = (host.clone(), s.lost().unwrap_or_else(|| format!("is gone: idle for {span}")));
         // Kept now, so a call before the end is done hears why.
         mark(&s.state, &s.handle, &why);
@@ -762,22 +732,16 @@ pub fn untrusted(host: &Host, env: &BTreeMap<String, String>) {
 
 /// Status rows: each declared adapter that is ready, and each live session, which holds an adapter.
 pub fn rows(host: &Host, launches: &[Launch]) -> Vec<State> {
-    let ready = launches.iter().filter(|l| l.protocol == Protocol::Dap).map(|l| (format!("dap:{}", l.id), "ready", "starts with debug test or attach".into(), None));
+    let row = |item: String, state: &str, reason: String| State { item, state: state.into(), reason: Some(reason), ..State::default() };
+    let ready = launches.iter().filter(|l| l.protocol == Protocol::Dap).map(|l| row(format!("dap:{}", l.id), "ready", "starts with debug test or attach".into()));
     let all: Vec<Arc<Session>> = lock(&host.debug).values().cloned().collect();
     let live = all.iter().map(|s| {
-        let idle = lock(&s.at).3.elapsed().as_secs();
-        let state = if lock(&s.pending).is_some() { "running" } else { "stopped" };
-        (s.handle.clone(), state, format!("debug {}, idle {idle} s", s.scope), Some(vec!["stop".to_string(), s.handle.clone()]))
+        let at = lock(&s.at);
+        let reason = format!("debug {}, idle {} s", s.scope, at.used.elapsed().as_secs());
+        let next = Some(vec!["stop".to_string(), s.handle.clone()]);
+        State { actor: Some("agent".into()), next, ..row(s.handle.clone(), if at.pending.is_some() { "running" } else { "stopped" }, reason) }
     });
-    let row = |(item, state, reason, next): (String, &str, String, Option<Vec<String>>)| State {
-        item,
-        state: state.into(),
-        reason: Some(reason),
-        actor: next.as_ref().map(|_| "agent".into()),
-        next,
-        ..State::default()
-    };
-    ready.chain(live.collect::<Vec<_>>()).map(row).collect()
+    ready.chain(live).collect()
 }
 
 /// `debug test <target> [filter|run:N/T1] [--at L…] [--log L=text…]` and `debug attach
@@ -798,7 +762,8 @@ fn start(host: &Arc<Host>, caller: &Caller, verb: &str, args: &Args, scope: &str
     let l = d.and_then(|d| r.launches.iter().find(|l| l.protocol == Protocol::Dap && l.id == d.0.adapter));
     // The declared adapter's entry, ready or not: its `hide_vars` hold for an attach too.
     let server = d.and_then(|d| d.1.iter().find(|s| s.id == d.0.adapter));
-    let (adapter, hide) = (server.and_then(|s| s.adapter_id.clone()), server.map_or(&[][..], |s| &s.hide_vars[..]));
+    let hide: Vec<Regex> = server.map_or(&[][..], |s| &s.hide_vars[..]).iter().filter_map(|h| Regex::new(h).ok()).collect();
+    let id = server.and_then(|s| s.adapter_id.clone()).or(l.map(|l| l.id.clone())).unwrap_or_else(|| "itse".into());
     // `debug test [target] [filter] [run:N/Tk]`, the item in any place.
     let mut plain = args.rest.iter().filter(|a| named(a).is_none()).cloned();
     let (state, target, filter) = (host.ws.state_dir(&host.dirs), plain.next().unwrap_or_default(), plain.next().unwrap_or_default());
@@ -806,50 +771,59 @@ fn start(host: &Arc<Host>, caller: &Caller, verb: &str, args: &Args, scope: &str
     let tests = format!("{} (", if target.is_empty() { host.ws.root.file_name().unwrap_or_default().to_string_lossy().into() } else { target.clone() });
     let rule = rule(&host.ws.root, &caller.cwd, &Store(state.clone()), args, (verb == "test").then_some(tests.as_str()), &packages)?;
     let env = env::workspace_env(&r, &host.dirs, caller.env.clone(), &store::Real(caller.env.clone()))?;
-    let (d, picked) = match (d.map(|d| d.0), l) {
-        (None, _) if verb == "test" => bail!("no extension in use declares how its tests run under a debugger (debug.adapter)"),
-        (Some(d), None) if verb == "test" => bail!("the debug adapter {} is not ready; itse status shows why", d.adapter),
-        (d, l) => (d, d.zip(l)),
+    let d = d.map(|d| d.0);
+    let picked = match (d, l) {
+        _ if verb == "attach" => None,
+        (None, _) => bail!("no extension in use declares how its tests run under a debugger (debug.adapter)"),
+        (Some(d), None) => bail!("the debug adapter {} is not ready; itse status shows why", d.adapter),
+        (Some(d), Some(l)) => Some((d, l)),
     };
-    let handle = Next::take(&state, "dbg")?;
-    sys::private_dir(&state.join("debug").join(&handle[4..]))?;
-    let log = state.join("debug").join(&handle[4..]).join("adapter.log");
-    // An arguments object always, as DAP has it, though the extension leaves it out.
-    let object = |v: Value| if v.is_null() { json!({}) } else { v };
-    let inputs: BTreeMap<String, String> = [("target".to_string(), target.clone()), ("filter".into(), filter)].into();
-    let mut fill = |k: &str| match k.split_once(':') {
-        Some(("input", i)) => inputs.get(i).cloned(),
-        _ => (k == "workspaceFolder").then(|| host.ws.root.display().to_string()),
+    let handle = host::Next::take(&state, "dbg")?;
+    sys::private_dir(&folder(&state, &handle))?;
+    let mut fill = |k: &str| match k {
+        "input:target" => Some(target.clone()),
+        "input:filter" => Some(filter.clone()),
+        "workspaceFolder" => Some(host.ws.root.display().to_string()),
+        _ => None,
     };
-    let mut opened = || -> Result<(Stream, String, Value)> {
-        if verb == "attach" {
-            let (h, port) = address(&json!(target))?;
-            return Ok((tcp(connect_loopback(&h, port, 50)?, Ends::default())?, "attach".into(), object(render_value(d.map_or(&Value::Null, |d| &d.attach), &mut fill)?)));
+    let open_session = || -> Result<(Arc<Session>, bool, Vec<String>)> {
+        let (request, arguments) = match picked {
+            Some((d, _)) => (d.request.as_deref().unwrap_or("launch"), &d.arguments),
+            None => ("attach", d.map_or(&Value::Null, |d| &d.attach)),
+        };
+        // An attach's address first, so a non-loopback one is refused whatever the template holds.
+        if picked.is_none() {
+            loopback(&address(&json!(target))?.0)?;
         }
-        let (d, l) = picked.ok_or_else(|| anyhow!("no debug adapter"))?;
-        let arguments = object(render_value(&d.arguments, &mut fill)?);
-        Ok((open(host, &r, caller, l, &handle, &log, &env, cancel)?, d.request.clone().unwrap_or_else(|| "launch".into()), arguments))
-    };
-    let attached = opened().and_then(|((read, write, ends), request, arguments)| {
+        // An arguments object always, as DAP has it, though the extension leaves it out.
+        let arguments = match render_value(arguments, &mut fill)? {
+            Value::Null => json!({}),
+            v => v,
+        };
+        // Rendered before anything starts or connects, so a bad template leaves no adapter or socket behind.
+        let (read, write, ends) = match picked {
+            Some((_, l)) => open(host, &r, caller, l, &handle, &folder(&state, &handle).join("adapter.log"), &env, cancel)?,
+            None => address(&json!(target)).and_then(|(h, port)| tcp(connect_loopback(&h, port, 50)?, Ends::default()))?,
+        };
         let events = Arc::new(Events::default());
         let peer = Peer::start(read, write, Framing::Headers, Dialect::Dap, events.clone());
-        let hide = hide.iter().filter_map(|h| Regex::new(h).ok()).collect();
-        let (root, at, launch, caps, ended) = (host.ws.root.clone(), Mutex::new((1, Value::Null, 0, started)), request == "launch", OnceLock::new(), AtomicBool::new(false));
-        let (pending, scope, log, state) = (Mutex::new(None), scope.to_string(), log.clone(), state.clone());
-        let s = Arc::new(Session { handle: handle.clone(), peer, events, caps, ends, launch, root, state, hide, at, pending, ended, scope, log });
-        let id = adapter.or(l.map(|l| l.id.clone())).unwrap_or_else(|| "itse".into());
-        let h = s.handshake(&id, &request, arguments, &rule, d.and_then(|d| d.caught_condition.as_deref()), until, cancel);
-        h.map(|h| (s.clone(), h)).inspect_err(|_| s.end(host, &s.lost().unwrap_or_else(|| FAILED.into())))
-    });
+        let at = Mutex::new(At { thread: 1, last: Value::Null, taken: 0, used: started, pending: None });
+        let (handle, root, state, scope) = (handle.clone(), host.ws.root.clone(), state.clone(), scope.to_string());
+        let s = Arc::new(Session { handle, peer, events, caps: OnceLock::new(), ends, launch: request == "launch", root, state, hide, at, ended: AtomicBool::new(false), scope });
+        let h = s.handshake(&id, request, arguments, &rule, d.and_then(|d| d.caught_condition.as_deref()), until, cancel);
+        let (plain, notes) = h.inspect_err(|_| s.end(host, &s.lost().unwrap_or_else(|| FAILED.into())))?;
+        Ok((s, plain, notes))
+    };
+    let attached = open_session();
     host.usage.record(&caller.env, &caller.id.sess, Event::Attach { outcome: if attached.is_ok() { "ok" } else { "fail" } });
-    let (s, (plain, notes)) = attached.inspect_err(|_| mark(&state, &handle, FAILED))?;
+    let (s, plain, notes) = attached.inspect_err(|_| mark(&state, &handle, FAILED))?;
     lock(&host.debug).insert(handle, s.clone());
     let ended = |_: &anyhow::Error| s.end(host, &s.lost().unwrap_or_else(|| "is stopped".into()));
-    let (stop, skipped) = s.first_stop(plain, until, cancel).inspect_err(ended)?;
+    let (stop, skipped) = s.wait_stop(until, None, plain, cancel).inspect_err(ended)?;
     let notes: Vec<String> = (skipped > 0).then(|| format!("{skipped} framework stops skipped")).into_iter().chain(notes).chain(s.ends.notes.clone()).collect();
     let text = if notes.is_empty() { rule.text } else { format!("{} ({})", rule.text, notes.join("; ")) };
     let text = if rule.logs.is_empty() { text } else { format!("{text}; logpoints at {}", rule.logs.join(", ")) };
-    s.settle(host, caller, scope, stop, plain, Some(&text), 0, cancel).inspect_err(ended)
+    s.settle(host, caller, scope, stop, Some(&text), 0, cancel).inspect_err(ended)
 }
 
 /// The `debug` verb: `test` and `attach` start a session; `step [over|in|out]`, `continue`, `eval
@@ -860,8 +834,8 @@ pub fn debug(host: &Arc<Host>, caller: &Caller, args: &Args, wait: Duration, can
     let until = started + wait;
     let scope = [verb].into_iter().chain(args.rest.iter().map(String::as_str)).collect::<Vec<_>>().join(" ");
     let done = || -> Result<Outcome> {
-        let frame = args.flags.get("frame").and_then(Value::as_str).map_or(Some(1), |f| f.trim_start_matches('F').parse().ok()).filter(|n: &usize| *n > 0);
-        let frame = frame.ok_or_else(|| anyhow!("--frame takes F1, F2, …"))? - 1;
+        let frame = args.flags.get("frame").and_then(Value::as_str).map_or(Some(1), |f| f.trim_start_matches('F').parse().ok()).and_then(|n: usize| n.checked_sub(1));
+        let frame = frame.ok_or_else(|| anyhow!("--frame takes F1, F2, …"))?;
         match verb {
             "test" | "attach" => return start(host, caller, verb, args, &scope, started, until, cancel),
             "step" | "continue" | "eval" | "snapshot" | "stop" => {}
@@ -876,14 +850,13 @@ pub fn debug(host: &Arc<Host>, caller: &Caller, args: &Args, wait: Duration, can
             Err(e) => return Ok(Outcome { scope: scope.clone(), ..Outcome::error("debug", "unknown_id", format!("{e:#}")) }),
         };
         let mut at = lock(&s.at);
-        let (thread, last) = (at.0, at.1.clone());
-        at.3 = Instant::now();
+        at.used = Instant::now();
+        let (thread, last, pending) = (at.thread, at.last.clone(), at.pending);
         drop(at);
-        let pending = *lock(&s.pending);
         if let Some(plain) = pending {
             ensure!(verb == "snapshot", "{handle} has not stopped yet; 'itse debug snapshot {handle}' waits for its stop");
-            let stop = s.first_stop(plain, until, cancel)?.0;
-            return s.settle(host, caller, &scope, stop, plain, None, frame, cancel);
+            let stop = s.wait_stop(until, None, plain, cancel)?.0;
+            return s.settle(host, caller, &scope, stop, None, frame, cancel);
         }
         let cmd = match (verb, args.rest.get(1).map(String::as_str)) {
             ("eval", _) => {
@@ -901,8 +874,8 @@ pub fn debug(host: &Arc<Host>, caller: &Caller, args: &Args, wait: Duration, can
             (_, Some(other)) => bail!("'debug step' takes over, in or out, not '{other}'"),
         };
         s.resume(cmd, json!({"threadId": thread, "granularity": "line"}), cancel)?;
-        let stop = s.wait_stop(until, (cmd != "continue").then_some(thread), cancel)?;
-        s.settle(host, caller, &scope, stop, false, None, frame, cancel)
+        let stop = s.wait_stop(until, (cmd != "continue").then_some(thread), false, cancel)?.0;
+        s.settle(host, caller, &scope, stop, None, frame, cancel)
     };
     done().unwrap_or_else(|e| {
         let msg = format!("{e:#}");

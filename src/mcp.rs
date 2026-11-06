@@ -22,7 +22,7 @@ use crate::results::text;
 use crate::rpc::{self, Cancel, Framing};
 use crate::sys::lock;
 use crate::usage::{Event, clip};
-use crate::verbs::{self, Caller, Milestone, Tool, VERBS};
+use crate::verbs::{self, Caller, Tool, VERBS};
 
 /// Echoed when a client asks for one of these; otherwise the newest is offered and the client decides.
 pub const SUPPORTED: [&str; 2] = ["2025-11-25", "2025-06-18"];
@@ -62,12 +62,12 @@ fn cli_line(tokens: &[String]) -> String {
 
 /// The verbs an agent can call through the core tools now: `stats` counts the others as never called.
 pub fn offered() -> Vec<&'static str> {
-    VERBS.iter().filter(|v| matches!(v.tool, Tool::Run | Tool::Query | Tool::Show) && v.milestone == Milestone::Built).map(|v| v.name).collect()
+    VERBS.iter().filter(|v| matches!(v.tool, Tool::Run | Tool::Query | Tool::Show)).map(|v| v.name).collect()
 }
 
 /// The tool list: three tools, and `debug` when opted in. Each verb enum comes from the verb table.
 pub fn tools(debug: bool) -> Vec<Value> {
-    let of = |t: Tool| VERBS.iter().filter(|v| v.tool == t && v.milestone == Milestone::Built).map(|v| v.name).collect::<Vec<_>>();
+    let of = |t: Tool| VERBS.iter().filter(|v| v.tool == t).map(|v| v.name).collect::<Vec<_>>();
     let schema = |verbs: Vec<&str>, extra: Value| {
         let mut props = json!({"verb": {"type": "string", "enum": verbs}, "target": {"type": "string"}, "args": {"type": "array", "items": {"type": "string"}}});
         if let Some((p, e)) = props.as_object_mut().zip(extra.as_object()) {
@@ -101,16 +101,13 @@ pub fn list_bytes(debug: bool) -> usize {
 /// around the writer keeps lines whole.
 pub fn serve_io(mut reader: impl BufRead, writer: &Mutex<impl Write + Send>, host: &Arc<Host>, caller: Caller) {
     let (calls, mut caller) = (Mutex::new(HashMap::<String, Cancel>::new()), Arc::new(caller));
-    let send = |id: Value, reply: Result<Value, (i64, String)>| {
-        let (key, value) = reply.map_or_else(|(code, message)| ("error", json!({"code": code, "message": message})), |r| ("result", r));
-        let _ = rpc::write(&mut *lock(writer), Framing::Lines, &json!({"jsonrpc": "2.0", "id": id, (key): value}));
-    };
+    let send = |id, reply| crate::daemon::respond(writer, id, reply);
     thread::scope(|scope| {
         loop {
             let mut msg = match rpc::read(&mut reader, Framing::Lines, rpc::MAX_FRAME) {
                 Ok(Some(msg)) => msg,
                 Err(e) if e.kind() == ErrorKind::InvalidData => {
-                    send(Value::Null, Err((-32700, e.to_string())));
+                    send(Value::Null, Err(json!({"code": -32700, "message": e.to_string()})));
                     continue;
                 }
                 _ => break,
@@ -140,7 +137,7 @@ pub fn serve_io(mut reader: impl BufRead, writer: &Mutex<impl Write + Send>, hos
                 }
                 // Other notifications, and responses: we send no requests.
                 _ if id.is_null() || method.is_empty() => continue,
-                _ => Err((-32601, format!("method not found: {method}"))),
+                _ => Err(json!({"code": -32601, "message": format!("method not found: {method}")})),
             };
             send(id, reply);
         }

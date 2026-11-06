@@ -436,6 +436,22 @@ fn a_non_loopback_address_is_refused_and_counted_as_a_failed_attach() {
 }
 
 #[test]
+fn an_attach_checks_its_address_before_the_template_and_connects_only_once_it_renders() {
+    let dbg = Dbg::new(json!("program"), "", json!({}));
+    assert_eq!(dbg.edit_ext(|e| e["debug"]["attach"] = json!({"x": "${cache}"})).0, Some(0));
+    assert_eq!(dbg.itse(&["trust"]).0, Some(0));
+    let (code, text) = dbg.itse(&["debug", "attach", "10.0.0.1:5005"]);
+    let refused = "ERROR debug attach 10.0.0.1:5005 — 10.0.0.1 is not 127.0.0.1 or ::1; itse connects to debug adapters on loopback only\n";
+    assert_eq!((code, text.as_str()), (Some(2), refused), "the loopback refusal comes before the template's error");
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let addr = format!("127.0.0.1:{}", listener.local_addr().unwrap().port());
+    let (code, text) = dbg.itse(&["debug", "attach", &addr]);
+    assert_eq!((code, text), (Some(2), format!("ERROR debug attach {addr} — nothing fills ${{cache}} in '${{cache}}'\n")));
+    assert!(listener.accept().is_err_and(|e| e.kind() == std::io::ErrorKind::WouldBlock), "no connection to the debuggee for a template that can't render");
+}
+
+#[test]
 fn lsp_command_mode_connects_to_the_returned_port() {
     let via = json!({"lsp_command": {"server": "fixture", "command": "start_debug_server"}});
     let dbg = Dbg::new(via, "", json!({"debug_port_as": "string"}));

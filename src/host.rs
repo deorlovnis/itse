@@ -9,15 +9,15 @@
 
 use std::collections::{BTreeMap, VecDeque};
 use std::io::{Read, Seek, SeekFrom};
-use std::os::unix::process::{CommandExt, ExitStatusExt};
-use std::process::{Child, Command, ExitStatus};
+use std::os::unix::{fs::OpenOptionsExt, process::CommandExt, process::ExitStatusExt};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
-use std::{env, ffi::OsString, fs, io, mem, panic, panic::AssertUnwindSafe, path::Path, path::PathBuf, thread, time::Duration, time::Instant, time::SystemTime};
+use std::{env, ffi::OsString, fs, fs::File, io, mem, panic, panic::AssertUnwindSafe, path::Path, path::PathBuf, thread, time::Duration, time::Instant, time::SystemTime};
 
 use anyhow::{Result, anyhow, bail, ensure};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use crate::actions::{self, Run};
 use crate::{lsp, manifest::Config, manifest::DapVia, rpc::Cancel, rpc::Peer, sys, sys::lock, usage::Usage, workspace::Dirs, workspace::Workspace};
@@ -96,6 +96,32 @@ impl Host {
         self.retrack(|p| p["handle"] != handle || p["pid"] != pid, None);
     }
 
+    /// Spawn `argv` as `l` runs it (its cwd, its env on top of `env`, its limits), marked with
+    /// `marker`, in its own group, stderr (and, unless `pipe`, stdout) appended to `log`; in
+    /// `procs.json` as `handle` of `kind` from the spawn on. The log file is returned too.
+    #[allow(clippy::too_many_arguments)]
+    pub fn spawn_as(&self, handle: &str, kind: &str, l: &Launch, argv: &[String], env: &BTreeMap<String, String>, log: &Path, marker: &str, pipe: bool) -> Result<(Child, File)> {
+        let (program, args) = argv.split_first().ok_or_else(|| anyhow!("{} has no command", l.id))?;
+        let file = fs::OpenOptions::new().create(true).append(true).mode(0o600).open(log)?;
+        let (input, output) = if pipe { (Stdio::piped(), Stdio::piped()) } else { (Stdio::null(), Stdio::from(file.try_clone()?)) };
+        let mut cmd = Command::new(program);
+        cmd.args(args).current_dir(&l.cwd).env_clear().envs(env).envs(l.env.iter().cloned()).env(MARKER, marker).stdin(input).stdout(output).stderr(file.try_clone()?);
+        let child = spawn(&mut cmd, &l.limits, false, 800).map_err(|e| anyhow!("starting {program}: {e}"))?;
+        let (pid, at) = (child.id() as i32, sys::utc(SystemTime::now()));
+        let start_time = sys::proc_stat(pid).map_or(0, |s| s.start_time);
+        let record = json!({"handle": handle, "kind": kind, "pid": pid, "pgid": pid, "start_time": start_time, "argv0": program, "started_at": at, "log": log, "marker": marker});
+        self.track(handle, Some(record));
+        Ok((child, file))
+    }
+
+    /// Kill `child`'s group and what carries `marker`, drop it from `procs.json`, and reap it.
+    pub fn kill_child(&self, handle: &str, child: &mut Child, marker: &str) -> io::Result<ExitStatus> {
+        let pid = child.id() as i32;
+        kill_tree(pid, marker, || drop(child.try_wait()));
+        self.untrack(handle, pid);
+        child.wait()
+    }
+
     fn retrack(&self, keep: impl Fn(&Value) -> bool, record: Option<Value>) {
         let mut procs = lock(&self.procs);
         procs.retain(keep);
@@ -140,16 +166,23 @@ impl Host {
         sys::sha256_hex(&keys.join(&b'\n'))[..12].to_string()
     }
 
-    /// Count a connection until the guard drops; an open one keeps the daemon alive.
-    pub fn enter(self: &Arc<Self>) -> Active {
-        self.conns.fetch_add(1, Ordering::SeqCst);
-        Active(self.clone())
+    /// Count a connection until the guard drops; an open connection keeps the daemon alive.
+    pub fn enter(self: &Arc<Self>) -> Count {
+        self.counted(false)
     }
 
     /// Count an attached MCP session until the guard drops.
-    pub fn session(self: &Arc<Self>) -> Session {
-        self.sessions.fetch_add(1, Ordering::SeqCst);
-        Session(self.clone())
+    pub fn session(self: &Arc<Self>) -> Count {
+        self.counted(true)
+    }
+
+    fn counted(self: &Arc<Self>, session: bool) -> Count {
+        self.count(session).fetch_add(1, Ordering::SeqCst);
+        Count { host: self.clone(), session }
+    }
+
+    fn count(&self, session: bool) -> &AtomicUsize {
+        if session { &self.sessions } else { &self.conns }
     }
 
     /// An attached MCP session, a live run or a live debug session keeps a replaced binary's daemon serving.
@@ -227,20 +260,19 @@ fn config(dirs: &Dirs) -> Config {
     fs::read(dirs.config.join("config.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
 }
 
-pub struct Active(Arc<Host>);
-
-impl Drop for Active {
-    fn drop(&mut self) {
-        *lock(&self.0.last) = Instant::now();
-        self.0.conns.fetch_sub(1, Ordering::SeqCst);
-    }
+/// A connection or an MCP session, counted while it lasts.
+pub struct Count {
+    host: Arc<Host>,
+    session: bool,
 }
 
-pub struct Session(Arc<Host>);
-
-impl Drop for Session {
+impl Drop for Count {
     fn drop(&mut self) {
-        self.0.sessions.fetch_sub(1, Ordering::SeqCst);
+        // A connection restarts the idle clock as it ends; a session ends inside its connection.
+        if !self.session {
+            *lock(&self.host.last) = Instant::now();
+        }
+        self.host.count(self.session).fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -278,8 +310,6 @@ pub struct Launch {
     #[allow(dead_code)]
     pub expose: bool,
     pub via: Option<DapVia>,
-    /// It doesn't watch files itself: the disk sync also sends `didChangeWatchedFiles`.
-    pub watch_client: bool,
 }
 
 /// rlimits set in `pre_exec` when declared (RLIMIT_CORE is always 0), and the OOM score written
@@ -488,10 +518,7 @@ impl Server {
     /// neither does this.
     pub fn stop(&self, wait: Duration) -> i32 {
         if self.peer.bye(wait) {
-            let end = Instant::now() + wait.min(Duration::from_secs(2));
-            while lock(&self.child).try_wait().is_ok_and(|st| st.is_none()) && Instant::now() < end {
-                thread::sleep(Duration::from_millis(20));
-            }
+            sys::wait_until(wait.min(Duration::from_secs(2)), || !lock(&self.child).try_wait().is_ok_and(|st| st.is_none()));
         }
         let pid = lock(&self.child).id() as i32;
         kill_tree(pid, &self.marker, || drop(lock(&self.child).try_wait()));
@@ -505,8 +532,7 @@ impl Server {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Crash {
     pub text: String,
-    /// From the package's `exit_codes`, such as `server_expired`.
-    pub mapped: Option<String>,
+    /// The last lines of its log.
     pub stderr_tail: Vec<String>,
 }
 
@@ -518,7 +544,7 @@ impl Crash {
             (_, Some(9)) => "killed by signal 9 (out of memory, or killed)".into(),
             (_, sig) => format!("killed by signal {}", sig.unwrap_or(0)),
         };
-        Self { text, mapped, stderr_tail: tail(log, 5) }
+        Self { text, stderr_tail: tail(log, 5) }
     }
 }
 

@@ -11,12 +11,12 @@
 
 use std::os::unix::{ffi::OsStrExt, fs::MetadataExt, fs::OpenOptionsExt};
 use std::{collections::BTreeMap, collections::BTreeSet, sync::Arc, sync::Condvar, sync::Mutex, sync::PoisonError, time::Duration, time::Instant, time::SystemTime};
-use std::{ffi::OsStr, fs, fs::File, fs::OpenOptions, io::BufReader, io::Read, io::Write, path::Path, path::PathBuf, process, process::Command, process::Stdio};
+use std::{ffi::OsStr, fs, fs::File, fs::OpenOptions, io::BufReader, io::Read, io::Write, path::Path, path::PathBuf, process};
 
 use anyhow::{Result, anyhow, bail, ensure};
 use serde_json::{Value, json};
 
-use crate::host::{self, Crash, Host, Launch, Live, Next, Phase, Protocol, Server, Slot};
+use crate::host::{Crash, Host, Launch, Live, Phase, Protocol, Server, Slot};
 use crate::manifest::Server as Declared;
 use crate::results::{Item, Loc, Outcome, State, Store, Verdict, text};
 use crate::rpc::{Cancel, Dialect, Framing, Handler, Peer, RpcError};
@@ -418,8 +418,8 @@ impl Ask {
     /// between the old and the new HEAD when it moved. A save alone may go unheard for a file the
     /// server doesn't hold, and rust-analyzer then runs no check. Even a checkout that leaves the
     /// tree clean gets one `didSave` (of an opened document, if no file of its filetypes changed),
-    /// since rust-analyzer reruns its check only on a save. With `watch: client` the server also
-    /// gets `didChangeWatchedFiles` for them. The files it told about, which `settle` waits for.
+    /// since rust-analyzer reruns its check only on a save. The files it told about, which `settle`
+    /// waits for.
     pub fn sync(&mut self) -> Vec<PathBuf> {
         // Live is never held while waiting for another lock: the reader and `status` need it.
         let (mut docs, mut told, mut saves, at) = (lock(&self.slot.docs), Vec::new(), Vec::new(), Instant::now());
@@ -456,11 +456,10 @@ impl Ask {
                 let mtime = |p: &PathBuf| stamp(p).map(|s| s.0);
                 let seen: BTreeMap<PathBuf, i128> = files.into_iter().filter(ours).filter_map(|p| Some((p.clone(), mtime(&p)?))).collect();
                 // The first status after a start only notes what is there: the server has just read the disk.
-                let (mut fresh, mut gone) = (vec![], vec![]);
+                let mut fresh = vec![];
                 if let Some(old) = &docs.git {
-                    // A file git no longer lists (reverted, stashed) changed too, or is gone.
+                    // A file git no longer lists (reverted, stashed) changed too.
                     let reverted: Vec<&PathBuf> = old.seen.keys().filter(|p| !seen.contains_key(*p) && !opened.contains(*p)).collect();
-                    gone = reverted.iter().filter(|p| !p.exists()).map(|p| json!({"uri": uri(p), "type": 3})).collect();
                     // Names only, with no external diff or textconv the repo's config could name; none while either HEAD is unknown.
                     let diff = ["diff", "--name-only", "-z", "--no-renames", "--no-ext-diff", "--no-textconv", &old.head, &head];
                     let moved = if old.head != head && !old.head.is_empty() && !head.is_empty() { git_paths(&self.root, &diff, 0).unwrap_or_default() } else { vec![] };
@@ -481,10 +480,6 @@ impl Ask {
                     save(peer, &uri, &p, None, with_text);
                     saves.push((uri, p.clone()));
                     told.push(p);
-                }
-                let changes: Vec<Value> = saves.iter().map(|(u, _)| json!({"uri": u, "type": 2})).chain(gone).collect();
-                if self.launch.watch_client && !changes.is_empty() {
-                    let _ = peer.notify("workspace/didChangeWatchedFiles", json!({"changes": changes}));
                 }
             }
         }
@@ -703,37 +698,27 @@ fn ask(host: &Arc<Host>, l: &Launch, env: &BTreeMap<String, String>, start: bool
 /// behind; the marker is the one `ITSE_*` var a server gets. A server that ends or fails before
 /// `initialize` answers has its group and its marked processes killed, and says how.
 fn start(host: &Host, slot: &Slot, l: &Launch, env: &BTreeMap<String, String>) -> Result<Server> {
-    let (program, args) = l.argv.split_first().ok_or_else(|| anyhow!("{} has no command", l.id))?;
+    // Before the log turns over, so a server that can't start leaves the last real logs as they were.
+    ensure!(!l.argv.is_empty(), "{} has no command", l.id);
     let (dir, handle) = (host.ws.state_dir(&host.dirs).join("servers"), format!("lsp:{}", l.id));
     sys::private_dir(&dir)?;
     let log = dir.join(format!("{}.log", l.id));
     let _ = fs::rename(&log, dir.join(format!("{}.log.1", l.id)));
     let marker = format!("{}-{}", process::id(), sys::hex(&sys::random_bytes::<8>()?));
-    let file = OpenOptions::new().create(true).append(true).mode(0o600).open(&log)?;
-    let mut cmd = Command::new(program);
-    cmd.args(args).current_dir(&l.cwd).env_clear().envs(env).envs(l.env.iter().cloned()).env(host::MARKER, &marker);
-    cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(file.try_clone()?);
-    let mut child = host::spawn(&mut cmd, &l.limits, false, 800).map_err(|e| anyhow!("starting {program}: {e}"))?;
+    let (mut child, file) = host.spawn_as(&handle, "lsp", l, &l.argv, env, &log, &marker, true)?;
     // Only the one start under way changes the epoch.
     let epoch = lock(&slot.live).epoch + 1;
     *lock(&slot.live) = Live { epoch, ..Live::default() };
     *lock(&slot.docs) = Docs { epoch, ..Docs::default() };
     let folders = json!([{"uri": uri(&host.ws.root), "name": host.ws.root.file_name().unwrap_or_default().to_string_lossy()}]);
     let reader = Reader { live: slot.live.clone(), woke: slot.woke.clone(), epoch, settings: l.settings.clone(), folders: folders.clone(), log: Some(Mutex::new(file)) };
-    let (Some(stdout), Some(stdin)) = (child.stdout.take(), child.stdin.take()) else { bail!("{program} has no stdio") };
+    let (Some(stdout), Some(stdin)) = (child.stdout.take(), child.stdin.take()) else { bail!("{} has no stdio", l.id) };
     let peer = Peer::start(BufReader::new(stdout), stdin, Framing::Headers, Dialect::Lsp, Arc::new(reader));
     let secs = std::env::var("ITSE_SERVER_IDLE_S").ok().and_then(|s| s.parse().ok());
     let idle = Duration::from_secs(secs.unwrap_or_else(|| l.idle_minutes.or(host.config().server_idle_minutes).unwrap_or(30) * 60));
-    let (pid, utc) = (child.id() as i32, sys::utc(SystemTime::now()));
-    let start_time = sys::proc_stat(pid).map_or(0, |s| s.start_time);
-    let record = json!({"handle": handle, "kind": "lsp", "pid": pid, "pgid": pid, "start_time": start_time, "argv0": program, "started_at": utc, "log": log, "marker": marker});
-    host.track(&handle, Some(record));
     let server = Server { peer, child: Mutex::new(child), exit_codes: l.exit_codes.clone(), log, idle, hash: launch_hash(l), marker, epoch };
     if let Err(e) = initialize(&server.peer, slot, l, &host.ws.root, folders) {
-        let mut child = lock(&server.child);
-        host::kill_tree(pid, &server.marker, || drop(child.try_wait()));
-        host.untrack(&handle, pid);
-        let ended = child.wait().map(|s| Crash::new(s, &l.exit_codes, &server.log));
+        let ended = host.kill_child(&handle, &mut lock(&server.child), &server.marker).map(|s| Crash::new(s, &l.exit_codes, &server.log));
         let tail = ended.as_ref().ok().and_then(|c| c.stderr_tail.last().map(|t| format!("; log: {t}"))).unwrap_or_default();
         bail!("{} before initialize answered ({e}){tail}", ended.map_or("killed".into(), |c| c.text));
     }
@@ -1052,7 +1037,7 @@ fn target(host: &Arc<Host>, caller: &BTreeMap<String, String>, session: &str, ve
         if n != 1 {
             let mut o = found.outcome(verb, name);
             if n > 1 {
-                o.id = Next::take(&store.0, "q").ok();
+                o.id = crate::host::Next::take(&store.0, "q").ok();
                 let next = Some(vec![verb.to_string(), o.id.as_ref().map_or_else(|| sid(1), |q| format!("{q}/{}", sid(1)))]);
                 o.states.push(State { item: name.into(), state: "ambiguous".into(), reason: Some(format!("{n} matches: pick one by its id")), next, ..State::default() });
             }
@@ -1068,76 +1053,65 @@ fn target(host: &Arc<Host>, caller: &BTreeMap<String, String>, session: &str, ve
     Ok((ask, json!({"textDocument": {"uri": uri}, "position": {"line": line, "character": col}}), item))
 }
 
-/// The outcome of a query, whichever way it ended.
-fn answer(query: impl FnOnce() -> Answer<Outcome>) -> Outcome {
-    query().unwrap_or_else(|o| *o)
-}
-
 /// `refs <name|S-id>`: the symbol, then its references (`includeDeclaration: false`) by file and line.
-pub fn refs(host: &Arc<Host>, caller: &BTreeMap<String, String>, session: &str, name: &str, cancel: &Cancel) -> Outcome {
-    answer(|| {
-        let (mut ask, mut params, item) = target(host, caller, session, "refs", name, cancel)?;
-        params["context"] = json!({"includeDeclaration": false});
-        let sent = ask.request("textDocument/references", params, cancel).map_err(|e| failed("refs", e))?;
-        let mut refs: Vec<Item> = sent.as_array().into_iter().flatten().map(|l| ask.item(String::new(), "ref", l, String::new())).collect();
-        refs.sort_by_key(|r| r.loc.as_ref().map(|l| (l.path.clone(), l.line, l.col)));
-        refs.iter_mut().enumerate().for_each(|(n, r)| r.id = format!("R{}", n + 1));
-        let files = refs.iter().filter_map(|r| r.loc.as_ref().map(|l| &l.path)).collect::<BTreeSet<_>>().len();
-        let counts = format!("{} in {}; {}", parse::plural(refs.len(), "reference"), parse::plural(files, "file"), ask.indexed());
-        let verdict = if refs.is_empty() { Verdict::Empty } else { Verdict::Ok };
-        let notes = std::mem::take(&mut ask.notes).into_iter().chain(["precise references only; strings and comments not searched".into()]).collect();
-        Ok(Outcome { items: [item].into_iter().chain(refs).collect(), notes, ..Outcome::new("refs", verdict, name, counts) })
-    })
+pub fn refs(host: &Arc<Host>, caller: &BTreeMap<String, String>, session: &str, name: &str, cancel: &Cancel) -> Answer<Outcome> {
+    let (mut ask, mut params, item) = target(host, caller, session, "refs", name, cancel)?;
+    params["context"] = json!({"includeDeclaration": false});
+    let sent = ask.request("textDocument/references", params, cancel).map_err(|e| failed("refs", e))?;
+    let mut refs: Vec<Item> = sent.as_array().into_iter().flatten().map(|l| ask.item(String::new(), "ref", l, String::new())).collect();
+    refs.sort_by_key(|r| r.loc.as_ref().map(|l| (l.path.clone(), l.line, l.col)));
+    refs.iter_mut().enumerate().for_each(|(n, r)| r.id = format!("R{}", n + 1));
+    let files = refs.iter().filter_map(|r| r.loc.as_ref().map(|l| &l.path)).collect::<BTreeSet<_>>().len();
+    let counts = format!("{} in {}; {}", parse::plural(refs.len(), "reference"), parse::plural(files, "file"), ask.indexed());
+    let verdict = if refs.is_empty() { Verdict::Empty } else { Verdict::Ok };
+    let notes = std::mem::take(&mut ask.notes).into_iter().chain(["precise references only; strings and comments not searched".into()]).collect();
+    Ok(Outcome { items: [item].into_iter().chain(refs).collect(), notes, ..Outcome::new("refs", verdict, name, counts) })
 }
 
 /// `info <name|S-id>`: the symbol at its definition, with the hover's signature and docs as its
 /// detail lines; markdown keeps its text, without fences and rules. Each is asked only of a server
 /// that offers it, and a failed definition keeps the hover, with a note.
-pub fn info(host: &Arc<Host>, caller: &BTreeMap<String, String>, session: &str, name: &str, cancel: &Cancel) -> Outcome {
-    answer(|| {
-        let (mut ask, params, mut item) = target(host, caller, session, "info", name, cancel)?;
-        let hover = ask.offers("hoverProvider").then(|| ask.request("textDocument/hover", params.clone(), cancel)).transpose().map_err(|e| failed("info", e))?.unwrap_or_default();
-        let def = ask.offers("definitionProvider").then(|| ask.request("textDocument/definition", params, cancel));
-        ask.notes.extend(def.as_ref().and_then(|d| d.as_ref().err()).map(|e| format!("{e:#}")));
-        // A Location, a list of them, or LocationLinks.
-        let def = def.and_then(Result::ok).unwrap_or_default();
-        let def = if def.is_array() { def[0].clone() } else { def };
-        let def = if def["targetUri"].is_string() { json!({"uri": def["targetUri"], "range": def["targetSelectionRange"]}) } else { def };
-        if def["uri"].as_str().and_then(path_of).is_some() {
-            let at = ask.item(String::new(), "", &def, String::new());
-            (item.loc, item.src) = (at.loc, at.src);
-        }
-        let contents = &hover["contents"];
-        let parts: Vec<&str> = contents.as_array().map_or_else(|| vec![contents], |a| a.iter().collect()).into_iter().filter_map(|c| c.as_str().or(c["value"].as_str())).collect();
-        let lines = parts.iter().flat_map(|p| p.lines()).map(str::trim_end).filter(|l| !l.is_empty() && !l.starts_with("```") && *l != "---");
-        item.detail = lines.take(40).map(|l| clip(l, MAX_TEXT)).collect();
-        let counts = format!("1 match; {}", ask.indexed());
-        Ok(Outcome { items: vec![item], notes: std::mem::take(&mut ask.notes), ..Outcome::new("info", Verdict::Ok, name, counts) })
-    })
+pub fn info(host: &Arc<Host>, caller: &BTreeMap<String, String>, session: &str, name: &str, cancel: &Cancel) -> Answer<Outcome> {
+    let (mut ask, params, mut item) = target(host, caller, session, "info", name, cancel)?;
+    let hover = ask.offers("hoverProvider").then(|| ask.request("textDocument/hover", params.clone(), cancel)).transpose().map_err(|e| failed("info", e))?.unwrap_or_default();
+    let def = ask.offers("definitionProvider").then(|| ask.request("textDocument/definition", params, cancel));
+    ask.notes.extend(def.as_ref().and_then(|d| d.as_ref().err()).map(|e| format!("{e:#}")));
+    // A Location, a list of them, or LocationLinks.
+    let def = def.and_then(Result::ok).unwrap_or_default();
+    let def = if def.is_array() { def[0].clone() } else { def };
+    let def = if def["targetUri"].is_string() { json!({"uri": def["targetUri"], "range": def["targetSelectionRange"]}) } else { def };
+    if def["uri"].as_str().and_then(path_of).is_some() {
+        let at = ask.item(String::new(), "", &def, String::new());
+        (item.loc, item.src) = (at.loc, at.src);
+    }
+    let contents = &hover["contents"];
+    let parts: Vec<&str> = contents.as_array().map_or_else(|| vec![contents], |a| a.iter().collect()).into_iter().filter_map(|c| c.as_str().or(c["value"].as_str())).collect();
+    let lines = parts.iter().flat_map(|p| p.lines()).map(str::trim_end).filter(|l| !l.is_empty() && !l.starts_with("```") && *l != "---");
+    item.detail = lines.take(40).map(|l| clip(l, MAX_TEXT)).collect();
+    let counts = format!("1 match; {}", ask.indexed());
+    Ok(Outcome { items: vec![item], notes: std::mem::take(&mut ask.notes), ..Outcome::new("info", Verdict::Ok, name, counts) })
 }
 
 /// `outline <path>`: the file's symbols from `textDocument/documentSymbol`, from the server whose
 /// filetypes hold its extension; a nested one after its parent, two levels deep.
-pub fn outline(host: &Arc<Host>, caller: &BTreeMap<String, String>, cwd: &Path, path: &str, cancel: &Cancel) -> Outcome {
-    answer(|| {
-        // From the caller's folder first, as every path the CLI takes, then from the root; one form of
-        // each path, so `../a.rs` is not a second document.
-        let file = [cwd.join(path), host.ws.root.join(path)].into_iter().find_map(|p| fs::canonicalize(p).ok().filter(|p| p.is_file()));
-        let file = file.ok_or_else(|| Box::new(Outcome::error("outline", "bad_args", format!("no file {path}"))))?;
-        let mut ask = server_for(host, caller, "outline", path, &file, cancel)?;
-        let uri = ask.open(&file).map_err(|e| failed("outline", e))?;
-        ask.catch_up(WAIT, cancel);
-        let symbols = ask.request("textDocument/documentSymbol", json!({"textDocument": {"uri": uri}}), cancel).map_err(|e| failed("outline", e))?;
-        // Hierarchical `DocumentSymbol`s, depth first; flat `SymbolInformation`s carry their location.
-        let (mut todo, mut items): (Vec<(usize, &Value)>, Vec<Item>) = (symbols.as_array().into_iter().flatten().rev().map(|s| (0, s)).collect(), Vec::new());
-        while let Some((depth, s)) = todo.pop() {
-            let loc = if s["location"].is_object() { s["location"].clone() } else { json!({"uri": uri, "range": s["selectionRange"]}) };
-            items.push(ask.item(sid(items.len() + 1), kind(s), &loc, format!("{}{}", "  ".repeat(depth), s["name"].as_str().unwrap_or(""))));
-            todo.extend(s["children"].as_array().into_iter().flatten().rev().filter(|_| depth == 0).map(|c| (1, c)));
-        }
-        let counts = format!("{}; {}", parse::plural(items.len(), "symbol"), ask.indexed());
-        Ok(Outcome { items, notes: std::mem::take(&mut ask.notes), ..Outcome::new("outline", Verdict::Ok, path, counts) })
-    })
+pub fn outline(host: &Arc<Host>, caller: &BTreeMap<String, String>, cwd: &Path, path: &str, cancel: &Cancel) -> Answer<Outcome> {
+    // From the caller's folder first, as every path the CLI takes, then from the root; one form of
+    // each path, so `../a.rs` is not a second document.
+    let file = [cwd.join(path), host.ws.root.join(path)].into_iter().find_map(|p| fs::canonicalize(p).ok().filter(|p| p.is_file()));
+    let file = file.ok_or_else(|| Box::new(Outcome::error("outline", "bad_args", format!("no file {path}"))))?;
+    let mut ask = server_for(host, caller, "outline", path, &file, cancel)?;
+    let uri = ask.open(&file).map_err(|e| failed("outline", e))?;
+    ask.catch_up(WAIT, cancel);
+    let symbols = ask.request("textDocument/documentSymbol", json!({"textDocument": {"uri": uri}}), cancel).map_err(|e| failed("outline", e))?;
+    // Hierarchical `DocumentSymbol`s, depth first; flat `SymbolInformation`s carry their location.
+    let (mut todo, mut items): (Vec<(usize, &Value)>, Vec<Item>) = (symbols.as_array().into_iter().flatten().rev().map(|s| (0, s)).collect(), Vec::new());
+    while let Some((depth, s)) = todo.pop() {
+        let loc = if s["location"].is_object() { s["location"].clone() } else { json!({"uri": uri, "range": s["selectionRange"]}) };
+        items.push(ask.item(sid(items.len() + 1), kind(s), &loc, format!("{}{}", "  ".repeat(depth), s["name"].as_str().unwrap_or(""))));
+        todo.extend(s["children"].as_array().into_iter().flatten().rev().filter(|_| depth == 0).map(|c| (1, c)));
+    }
+    let counts = format!("{}; {}", parse::plural(items.len(), "symbol"), ask.indexed());
+    Ok(Outcome { items, notes: std::mem::take(&mut ask.notes), ..Outcome::new("outline", Verdict::Ok, path, counts) })
 }
 
 /// What the LSP servers in use pushed, for `problems`.

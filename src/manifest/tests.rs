@@ -92,6 +92,12 @@ fn unknown_keys_are_refused_and_vs_code_ui_keys_kept_aside() {
 }
 
 #[test]
+fn an_extension_added_with_watch_client_still_reads() {
+    let ext = r#"{"itse_ext": 1, "id": "w", "servers": [{"id": "s", "command": ["s"], "filetypes": ["rs"], "watch": "client"}]}"#;
+    assert_eq!(parse_ext(ext, "w.json").map(|e| e.servers.len()).map_err(|e| format!("{e:#}")), Ok(1), "an older extension's ignored key never locks it out");
+}
+
+#[test]
 fn a_dap_adapter_is_reached_by_program_tcp_or_lsp_command() {
     let via = |s: &str| serde_json::from_str::<DapVia>(s).unwrap();
     assert_eq!(via(r#""program""#), DapVia::Program);

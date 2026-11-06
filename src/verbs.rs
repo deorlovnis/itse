@@ -16,7 +16,7 @@ use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
-use std::{fs, process, thread};
+use std::{fs, process};
 
 use anyhow::{Result, bail, ensure};
 use lexopt::prelude::*;
@@ -24,7 +24,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::daemon::{VERSION, client, proto};
-use crate::host::{Host, Next};
+use crate::host::{self, Host};
 use crate::resolve::{Resolved, resolve, target};
 use crate::results::{self, DETAIL, HOOK, Outcome, State, Store, VERB, Verdict, text};
 use crate::rpc::Cancel;
@@ -51,14 +51,6 @@ pub enum Runs {
     Local,
 }
 
-/// `Built` verbs are served; a `Reserved` name belongs to a planned verb and answers RESERVED
-/// (exit 2) until it is built.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum Milestone {
-    Built,
-    Reserved,
-}
-
 /// A verb's arguments: the first positional is `target`, the others and any `Rest` go to `rest`;
 /// flags go to `flags` by name: `Flag` as true, `Opt` as its value, `Many` as a list of values.
 /// A `Req` positional must be given, and comes before any `Pos`.
@@ -79,12 +71,11 @@ pub struct Verb {
     pub params: &'static [Param],
     pub runs: Runs,
     pub human_only: bool,
-    pub milestone: Milestone,
     pub about: &'static str,
 }
 
 const fn verb(name: &'static str, tool: Tool, runs: Runs, params: &'static [Param], about: &'static str) -> Verb {
-    Verb { name, tool, params, runs, human_only: false, milestone: Milestone::Built, about }
+    Verb { name, tool, params, runs, human_only: false, about }
 }
 
 const fn human(v: Verb) -> Verb {
@@ -126,13 +117,11 @@ pub const VERBS: &[Verb] = &[
     verb("stop", Tool::Run, Daemon, &[Req("handle")], "stop a server or debug session"),
     verb("cancel", Tool::Run, Daemon, &[Req("run")], "cancel a run"),
     verb("stats", Tool::CliOnly, Local, &[Opt("since"), Opt("by"), Flag("json")], "the local usage log, summed"),
-    verb("verbs", Tool::CliOnly, Local, &[Flag("md"), Flag("json")], "the verb index"),
+    verb("verbs", Tool::CliOnly, Local, &[Flag("json")], "the verb index"),
     human(verb("integrate", Tool::CliOnly, Local, &[Req("ext"), Flag("skill"), Flag("mcp"), Opt("recipe"), Flag("remove"), Opt("home"), Flag("yes")], "set up a harness")),
     verb("hook", Tool::CliOnly, Local, &[Req("recipe")], "a harness hook; never starts the daemon"),
     verb("mcp", Tool::CliOnly, Local, &[], "the MCP endpoint on stdio"),
     verb("daemon", Tool::CliOnly, Local, &[Pos("stop|restart|status")], "the workspace daemon"),
-    Verb { milestone: Milestone::Reserved, ..verb("rename", Tool::CliOnly, Local, &[Rest("args")], "reserved") },
-    Verb { milestone: Milestone::Reserved, ..verb("fix", Tool::CliOnly, Local, &[Rest("args")], "reserved") },
     verb("__daemonize", Tool::CliOnly, Local, &[], "start the daemon in its own session"),
     verb("__run", Tool::CliOnly, Local, &[Pos("rundir")], "the runner of one action"),
 ];
@@ -203,34 +192,30 @@ pub struct Caller {
 /// result, and record the call in the usage log. Answers `{exit, text}`.
 pub fn call(host: &Arc<Host>, caller: &Caller, params: &Value, cancel: &Cancel) -> Value {
     let (started, name) = (Instant::now(), params["verb"].as_str().unwrap_or(""));
-    let verb = find(name).filter(|v| v.milestone == Milestone::Built && !v.name.starts_with("__"));
+    let verb = find(name).filter(|v| !v.name.starts_with("__"));
     let page = params["page"].as_u64().map_or(1, |p| p.min(u32::MAX.into()) as u32);
     let store = Store(host.ws.state_dir(&host.dirs));
     let (via, session) = (caller.mode.as_str(), caller.id.session.as_str());
     let wait = Duration::from_secs(params["wait"].as_u64().unwrap_or(if via == "mcp" { 50 } else { 100 }));
+    let sh = |o, n| shape(o, &store, via, session, n);
     let answer = match verb.map(|v| (v, args(v, &params["args"]))) {
-        None => shape(Outcome::error(name, "unknown_verb", "not a daemon verb"), &store, via, session, 1),
-        Some((v, Err(e))) => shape(Outcome::error(v.name, "bad_args", format!("{e}")), &store, via, session, 1),
+        None => sh(Outcome::error(name, "unknown_verb", "not a daemon verb"), 1),
+        Some((v, Err(e))) => sh(Outcome::error(v.name, "bad_args", format!("{e}")), 1),
         Some((v, Ok(args))) if via == "mcp" && (v.human_only || (v.name == "ext" && matches!(args.target.as_deref(), Some("add" | "remove")))) => {
             let tokens: Vec<String> = [v.name].into_iter().chain(params["args"].as_array().into_iter().flatten().filter_map(Value::as_str)).map(String::from).collect();
             let counts = text("human", &[("cmd", &crate::mcp::next(&tokens, via, true))]);
-            shape(Outcome { err: Some("needs_human"), ..Outcome::new(v.name, Verdict::NeedsHuman, "", counts) }, &store, via, session, 1)
+            sh(Outcome { err: Some("needs_human"), ..Outcome::new(v.name, Verdict::NeedsHuman, "", counts) }, 1)
         }
-        Some((v, Ok(_))) if via == "mcp" && v.tool == Tool::CliOnly => shape(Outcome::error(v.name, "bad_args", text("cli_only", &[])), &store, via, session, 1),
+        Some((v, Ok(_))) if via == "mcp" && v.tool == Tool::CliOnly => sh(Outcome::error(v.name, "bad_args", text("cli_only", &[])), 1),
         // A tool carries the verbs of its enum only, so `debug` stays out of reach until opted in.
         Some((v, Ok(_))) if via == "mcp" && params["tool"] != crate::mcp::tool_name(v.tool) => {
-            shape(Outcome::error(v.name, "bad_args", text("wrong_tool", &[("tool", &params["tool"].as_str().unwrap_or(""))])), &store, via, session, 1)
+            sh(Outcome::error(v.name, "bad_args", text("wrong_tool", &[("tool", &params["tool"].as_str().unwrap_or(""))])), 1)
         }
         Some((v, Ok(args))) => match v.name {
-            "status" => shape(status(host, caller, &args, cancel), &store, via, session, page),
+            "status" => sh(status(host, caller, &args, cancel), page),
             "show" => results::show(&store, &args, via, session),
-            "install" | "lock" | "gc" => {
-                let o = store_verb(&host.ws, &host.dirs, caller, v.name, &args, cancel, &store::Real(caller.env.clone()));
-                shape(o, &store, via, session, page)
-            }
-            "run" | "build" | "test" => {
-                shape(run(host, caller, v.name, &args, wait, cancel).unwrap_or_else(|e| Outcome::error(v.name, "bad_args", format!("{e:#}"))), &store, via, session, page)
-            }
+            "install" | "lock" | "gc" => sh(store_verb(&host.ws, &host.dirs, caller, v.name, &args, cancel, &store::Real(caller.env.clone())), page),
+            "run" | "build" | "test" => sh(run(host, caller, v.name, &args, wait, cancel).unwrap_or_else(|e| Outcome::error(v.name, "bad_args", format!("{e:#}"))), page),
             "problems" => {
                 let (scope, all, new) = (args.target.as_deref().unwrap_or(""), args.flags.contains_key("all"), args.flags.contains_key("new"));
                 // A debug-only seam for the tests of a server that doesn't settle in time.
@@ -250,25 +235,22 @@ pub fn call(host: &Arc<Host>, caller: &Caller, params: &Value, cancel: &Cancel) 
                     notes: o.notes.iter().cloned().chain(lsp.notes).collect(),
                     ..o
                 });
-                shape(o.unwrap_or_else(|e| Outcome::error("problems", "io", format!("{e:#}"))), &store, via, session, page)
+                sh(o.unwrap_or_else(|e| Outcome::error("problems", "io", format!("{e:#}"))), page)
             }
-            "cancel" | "stop" => shape(stop(host, v.name, args.target.as_deref().unwrap_or_default()), &store, via, session, page),
-            "debug" => shape(crate::dap::debug(host, caller, &args, wait, cancel), &store, via, session, page),
-            "find" => {
-                let kind = args.flags.get("kind").and_then(Value::as_str);
-                shape(crate::lsp::find(host, &caller.env, args.target.as_deref().unwrap_or_default(), kind, cancel), &store, via, session, page)
-            }
-            "refs" => shape(crate::lsp::refs(host, &caller.env, session, args.target.as_deref().unwrap_or_default(), cancel), &store, via, session, page),
-            "info" => shape(crate::lsp::info(host, &caller.env, session, args.target.as_deref().unwrap_or_default(), cancel), &store, via, session, page),
-            "outline" => shape(crate::lsp::outline(host, &caller.env, &caller.cwd, args.target.as_deref().unwrap_or_default(), cancel), &store, via, session, page),
+            "cancel" | "stop" => sh(stop(host, v.name, args.target.as_deref().unwrap_or_default()), page),
+            "debug" => sh(crate::dap::debug(host, caller, &args, wait, cancel), page),
+            "find" => sh(crate::lsp::find(host, &caller.env, args.target.as_deref().unwrap_or_default(), args.flags.get("kind").and_then(Value::as_str), cancel), page),
+            "refs" => sh(crate::lsp::refs(host, &caller.env, session, args.target.as_deref().unwrap_or_default(), cancel).unwrap_or_else(|o| *o), page),
+            "info" => sh(crate::lsp::info(host, &caller.env, session, args.target.as_deref().unwrap_or_default(), cancel).unwrap_or_else(|o| *o), page),
+            "outline" => sh(crate::lsp::outline(host, &caller.env, &caller.cwd, args.target.as_deref().unwrap_or_default(), cancel).unwrap_or_else(|o| *o), page),
             "use" | "unuse" | "ext" | "trust" | "consent" => {
                 let o = manifest_verb(&host.ws, &host.dirs, &caller.env, &caller.cwd, v.name, &args, params["tty"] == true);
                 // A revoked trust or an unused extension leaves a server that may no longer run: it stops now.
                 let _ = crate::lsp::servers(host, &caller.env, v.name, "", &|_| false, false, cancel);
                 crate::dap::untrusted(host, &caller.env);
-                shape(o, &store, via, session, page)
+                sh(o, page)
             }
-            _ => shape(Outcome::error(v.name, "internal", text("not_built", &[])), &store, via, session, 1),
+            _ => sh(Outcome::error(v.name, "internal", text("not_built", &[])), 1),
         },
     };
     let ms = started.elapsed().as_millis() as u64;
@@ -297,7 +279,7 @@ fn shape(mut o: Outcome, store: &Store, via: &str, session: &str, n: u32) -> Ans
     let cap = if via == "hook" { HOOK } else { VERB };
     let mut text = o.render(via, n, cap, false);
     if o.id.is_none() && (!o.items.is_empty() || o.page.of > 1) {
-        o.id = Next::take(&store.0, "q").inspect_err(|e| eprintln!("itse daemon: results: {e:#}")).ok();
+        o.id = host::Next::take(&store.0, "q").inspect_err(|e| eprintln!("itse daemon: results: {e:#}")).ok();
         text = o.render(via, n, cap, false);
     }
     let text = match text {
@@ -329,7 +311,7 @@ fn exit(a: &Answer) -> u8 {
         // A debug start that never stopped did not do what it was for.
         Verdict::Exited if ["EXITED debug test", "EXITED debug attach"].iter().any(|p| a.text.starts_with(p)) => 1,
         Verdict::Empty if a.text.split(' ').nth(1).is_some_and(|v| matches!(v, "find" | "info" | "refs")) => 1,
-        Verdict::Error | Verdict::Reserved => 2,
+        Verdict::Error => 2,
         Verdict::NeedsHuman | Verdict::NeedsConsent | Verdict::Untrusted | Verdict::Blocked => 3,
         Verdict::Running => 4,
         _ => 0,
@@ -342,31 +324,13 @@ fn record(usage: &Usage, caller: &Caller, verb: &str, ms: u64, a: &Answer) {
         (_, Some("cancel")) => "cancel",
         (_, Some("timeout")) => "timeout",
         (Verdict::Fail, _) => "fail",
-        (_, Some(_)) | (Verdict::Error | Verdict::Reserved, _) => "error",
+        (_, Some(_)) | (Verdict::Error, _) => "error",
         _ => "ok",
     };
-    let via = match caller.mode.as_str() {
-        "mcp" => "mcp",
-        "hook" => "hook",
-        _ => "cli",
-    };
-    let err = a.err.filter(|e| !matches!(*e, "cancel" | "timeout"));
+    let via = ["mcp", "hook"].into_iter().find(|m| *m == caller.mode).unwrap_or("cli");
+    let (err, bytes) = (a.err.filter(|e| !matches!(*e, "cancel" | "timeout")), a.text.len() as u64);
     let (client, client_v) = (caller.id.client.clone(), caller.id.client_v.clone());
-    let call = Call {
-        via,
-        client,
-        client_v,
-        verb: verb.into(),
-        ext: None,
-        ms,
-        outcome,
-        err,
-        bytes: a.text.len() as u64,
-        full: a.full.max(a.text.len() as u64),
-        trunc: a.trunc,
-        warm: None,
-        settled: None,
-    };
+    let call = Call { via, client, client_v, verb: verb.into(), ms, outcome, err, bytes, full: a.full.max(bytes), trunc: a.trunc, ..Call::default() };
     usage.record(&caller.env, &caller.id.sess, Event::Call(call));
 }
 
@@ -543,7 +507,7 @@ pub fn local(usage: &Usage, ws: &Workspace, dirs: &Dirs, verb: &Verb, args: &Arg
         // `debug` is listed where an extension in use declares how its tests run under a debugger.
         let r = resolve(ws, dirs, &caller.env, SystemTime::now());
         let debug = r.is_ok_and(|r| r.manifest.uses().iter().filter_map(|u| r.manifest.exts.get(&u.id)).any(|e| e.0.debug.as_ref().is_some_and(|d| !d.adapter.is_empty())));
-        let text = index(args.flags.contains_key("md"), args.flags.contains_key("json"), debug);
+        let text = index(args.flags.contains_key("json"), debug);
         Answer { verdict: Verdict::Ok, full: text.len() as u64, text, trunc: false, err: None }
     } else {
         let mut o = manifest_verb(ws, dirs, &caller.env, &std::env::current_dir().unwrap_or_default(), verb.name, args, false);
@@ -554,13 +518,13 @@ pub fn local(usage: &Usage, ws: &Workspace, dirs: &Dirs, verb: &Verb, args: &Arg
     (answer.text.clone(), exit(&answer))
 }
 
-/// `itse verbs [--md|--json]`: the verb index for agents, from the table, without reserved,
-/// human-only and internal verbs, and with `debug` only if `debug`. Declared actions and extension
-/// skills are not listed yet.
-pub fn index(md: bool, json: bool, debug: bool) -> String {
+/// `itse verbs [--json]`: the verb index for agents, from the table, without human-only and
+/// internal verbs, and with `debug` only if `debug`. Declared actions and extension skills are
+/// not listed yet.
+pub fn index(json: bool, debug: bool) -> String {
     let rows: Vec<(&str, String, &str, &str)> = VERBS
         .iter()
-        .filter(|v| v.milestone == Milestone::Built && !v.human_only && !v.name.starts_with("__") && (debug || v.tool != Tool::Debug))
+        .filter(|v| !v.human_only && !v.name.starts_with("__") && (debug || v.tool != Tool::Debug))
         .map(|v| {
             let value = |n: &str| match n {
                 "at" => "path:line",
@@ -584,23 +548,7 @@ pub fn index(md: bool, json: bool, debug: bool) -> String {
         return json!({"verbs": verbs, "actions": [], "skills": []}).to_string() + "\n";
     }
     let tail = "exit codes: 0 ok, 1 the verb reports failure, 2 error, 3 needs a human, 4 running, 130 interrupted\nresults: the first line is VERDICT verb scope — counts; ids such as run:14/T1 open with 'itse show'\nactions: none declared\n";
-    if !md {
-        return rows.iter().map(|(n, a, _, about)| format!("itse {n} {a}").trim_end().to_string() + &format!("\n    {about}\n")).collect::<String>() + tail;
-    }
-    let table: String = rows
-        .iter()
-        .map(|(n, a, t, about)| {
-            format!(
-                "| `{n}` | {} | {} | {about} |\n",
-                if a.is_empty() { "–".into() } else { format!("`{}`", a.replace('|', "\\|")) },
-                if t.is_empty() { "–".into() } else { format!("`{t}`") }
-            )
-        })
-        .collect();
-    format!(
-        "# itse verbs\n\nGenerated by `itse verbs --md` for a workspace with only built-ins; `itse verbs` prints the current workspace's index.\n\n| Verb | Arguments | MCP tool | What it does |\n|---|---|---|---|\n{table}\n{}",
-        tail.replace('\n', "\n\n").trim_end().to_string() + "\n"
-    )
+    rows.iter().map(|(n, a, _, about)| format!("itse {n} {a}").trim_end().to_string() + &format!("\n    {about}\n")).collect::<String>() + tail
 }
 
 /// `status`: a row per item from the resolver, `suggested` ones included, then the
@@ -608,12 +556,8 @@ pub fn index(md: bool, json: bool, debug: bool) -> String {
 fn status(host: &Host, caller: &Caller, args: &Args, cancel: &Cancel) -> Outcome {
     // A debug-only seam for the Ctrl-C test: a status that takes this long unless cancelled.
     let slow = caller.env.get("ITSE_TEST_SLOW_MS").filter(|_| cfg!(debug_assertions)).and_then(|ms| ms.parse().ok());
-    let end = Instant::now() + Duration::from_millis(slow.unwrap_or(0));
-    while Instant::now() < end {
-        if cancel.is_cancelled() {
-            return Outcome::error("status", "cancel", text("cancelled", &[]));
-        }
-        thread::sleep(Duration::from_millis(20));
+    if slow.is_some_and(|ms| sys::wait_until(Duration::from_millis(ms), || cancel.is_cancelled())) {
+        return Outcome::error("status", "cancel", text("cancelled", &[]));
     }
     let r = match resolve(&host.ws, &host.dirs, &caller.env, SystemTime::now()) {
         Ok(r) => r,
@@ -621,28 +565,17 @@ fn status(host: &Host, caller: &Caller, args: &Args, cancel: &Cancel) -> Outcome
     };
     let (ws, pid, up) = (&host.ws, process::id(), host.started.elapsed().unwrap_or_default().as_secs());
     let (root, name) = (ws.root.display(), ws.repo_name().display());
-    let repo = match ws.git {
-        true => format!("repo: {name} (rid {}; git common dir {})", ws.rid, ws.repo.display()),
-        false => format!("repo: {name} (rid {})", ws.rid),
-    };
+    let common = if ws.git { format!("; git common dir {}", ws.repo.display()) } else { String::new() };
     let git = if ws.git { "" } else { "not a git work tree; " };
     let (debug, bytes) = (host.config().mcp.debug, crate::mcp::list_bytes);
-    let tools = format!(
-        "mcp tools: {} (~{} tokens incl. instructions; list {} of {} B); debug tool {}",
-        crate::mcp::tools(debug).len(),
-        bytes(debug) * 10 / 36,
-        bytes(debug),
-        crate::mcp::LIST_CAP,
-        if debug { "on".into() } else { format!("off (mcp.debug: true adds ~{} tokens)", (bytes(true) - bytes(false)) * 10 / 36) }
-    );
+    let (n, b, cap) = (crate::mcp::tools(debug).len(), bytes(debug), crate::mcp::LIST_CAP);
+    let on = if debug { "on".into() } else { format!("off (mcp.debug: true adds ~{} tokens)", (bytes(true) - bytes(false)) * 10 / 36) };
+    let tools = format!("mcp tools: {n} (~{} tokens incl. instructions; list {b} of {cap} B); debug tool {on}", b * 10 / 36);
     let log = host.usage.path();
-    let usage = match host.usage.on(&caller.env) {
-        true => format!("on, {} ({:.1} MB)", log.display(), fs::metadata(&log).map_or(0, |m| m.len()) as f64 / 1e6),
-        false => "off".into(),
-    };
+    let usage = if host.usage.on(&caller.env) { format!("on, {} ({:.1} MB)", log.display(), fs::metadata(&log).map_or(0, |m| m.len()) as f64 / 1e6) } else { "off".into() };
     let mut notes = vec![
         format!("workspace: {root} ({git}ws {})", ws.ws),
-        repo,
+        format!("repo: {name} (rid {}{common})", ws.rid),
         format!("daemon: pid {pid}, started by {} {up} s ago; {VERSION}; proto {}; env keys {}", host.started_by, proto(), host.env_keys_sha()),
         format!("socket: {}", host.socket.display()),
         tools,
@@ -678,11 +611,7 @@ pub fn stop_daemon(ws: &Workspace, dirs: &Dirs) -> Result<String> {
     let (live, sock) = (client::running(ws, dirs), ws.socket(dirs, Path::new("/tmp"))?);
     let told = UnixStream::connect(sock).is_ok_and(|s| client::ask(&mut BufReader::new(s), "shutdown", json!({"reason": "stop"}), Some(Duration::from_secs(2))).is_ok());
     let Some((pid, start, _)) = live else { return Ok(format!("{} for {}", if told { "told the daemon to stop" } else { "no daemon runs" }, ws.root.display())) };
-    let end = Instant::now() + Duration::from_secs(4);
-    while sys::alive(pid, start) && Instant::now() < end {
-        thread::sleep(Duration::from_millis(20));
-    }
-    let stopped = !sys::alive(pid, start);
+    let stopped = sys::wait_until(Duration::from_secs(4), || !sys::alive(pid, start));
     if !stopped {
         sys::kill_group(pid, Duration::from_secs(1), || ());
     }
@@ -707,16 +636,18 @@ mod tests {
     }
 
     #[test]
-    fn verbs_md_lists_every_verb_in_the_table() {
-        let md = index(true, false, true);
-        assert!(!index(true, false, false).contains("| `debug` |"), "debug only where a debug adapter is declared");
+    fn verbs_json_lists_every_verb_in_the_table() {
+        let index_of = |debug: bool| serde_json::from_str::<Value>(&index(true, debug)).unwrap();
+        let (all, plain) = (index_of(true), index(false, true));
+        assert!(!index_of(false)["verbs"].as_array().unwrap().iter().any(|v| v["name"] == "debug"), "debug only where a debug adapter is declared");
         for v in VERBS {
-            // Left out: reserved names, human-only verbs (an agent can't run them) and internal ones.
-            let left_out = v.milestone == Milestone::Reserved || v.human_only || v.name.starts_with("__");
-            let row = md.lines().find(|l| l.starts_with(&format!("| `{}` |", v.name)));
-            assert_eq!(row.is_none(), left_out, "{}: {md}", v.name);
+            // Left out: human-only verbs (an agent can't run them) and internal ones.
+            let left_out = v.human_only || v.name.starts_with("__");
+            let row = all["verbs"].as_array().unwrap().iter().find(|r| r["name"] == v.name);
+            assert_eq!(row.is_none(), left_out, "{}: {all}", v.name);
             if let Some(row) = row {
-                assert!(row.ends_with(&format!(" | {} |", v.about)), "{row}");
+                assert_eq!(row["about"], v.about, "{row}");
+                assert!(plain.contains(&format!("\n    {}\n", v.about)), "{}: {plain}", v.name);
             }
         }
     }

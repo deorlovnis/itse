@@ -42,7 +42,7 @@ use lexopt::prelude::*;
 use serde_json::json;
 
 use daemon::client;
-use verbs::{Args, Milestone, Runs, Verb};
+use verbs::{Args, Runs, Verb};
 use workspace::{Dirs, Workspace};
 
 const HELP_TAIL: &str = "
@@ -84,9 +84,6 @@ fn run() -> Result<u8> {
         Cmd::Verb(verb, args) if verb.name == "__run" => return actions::runner(Path::new(args.target.as_deref().unwrap_or_default())),
         Cmd::Verb(verb, args) => (verb, args),
     };
-    if verb.milestone == Milestone::Reserved {
-        return Ok(print(format!("RESERVED {} — planned, not built yet\n", verb.name), 2));
-    }
     let given = root.or_else(|| var_os("ITSE_WORKSPACE").filter(|v| !v.is_empty()).map(PathBuf::from));
     let ws = Workspace::find(given, &current_dir()?)?;
     let dirs = Dirs::from_env(|k| var_os(k))?;
@@ -138,7 +135,7 @@ fn print(text: String, exit: u8) -> u8 {
 
 fn help() -> String {
     let mut out = String::from("itse — a workbench for coding agents and their harnesses\n\nusage: itse [--root DIR] <verb> [args]\n\n");
-    for v in verbs::VERBS.iter().filter(|v| !v.name.starts_with("__") && v.milestone == Milestone::Built) {
+    for v in verbs::VERBS.iter().filter(|v| !v.name.starts_with("__")) {
         out += &format!("  {:<10}  {}\n", v.name, v.about);
     }
     out + HELP_TAIL

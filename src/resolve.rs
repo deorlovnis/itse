@@ -11,8 +11,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::{Duration, Instant, SystemTime};
-use std::{env, fs, thread};
+use std::time::{Duration, SystemTime};
+use std::{env, fs};
 
 use anyhow::{Result, anyhow};
 use serde_json::{Value, json};
@@ -253,7 +253,6 @@ fn launches(cx: &Cx, m: &Manifest, uses: &[Use], roots: &BTreeMap<String, PathBu
                 timeout_s: s.timeout_s,
                 expose: set.is_some_and(|x| x.expose),
                 via,
-                watch_client: s.watch.as_deref() == Some("client"),
             });
         }
     }
@@ -278,18 +277,17 @@ fn system_check(c: &SystemCheck) -> Result<(), String> {
     let Some((prog, args)) = c.cmd.split_first() else { return Ok(()) };
     let cmd = c.cmd.join(" ");
     let mut child = Command::new(prog).args(args).current_dir("/").stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().map_err(|e| format!("{cmd}: {e}"))?;
-    let end = Instant::now() + Duration::from_secs(5);
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) if status.success() => return Ok(()),
-            Ok(Some(status)) => return Err(format!("{cmd} exit {}", status.code().unwrap_or(-1))),
-            Ok(None) if Instant::now() < end => thread::sleep(Duration::from_millis(20)),
-            _ => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(format!("{cmd} took over 5 s"));
-            }
+    // try_wait keeps a status once it has one, so asking again after the wait is free.
+    sys::wait_until(Duration::from_secs(5), || !matches!(child.try_wait(), Ok(None)));
+    match child.try_wait() {
+        Ok(Some(status)) if status.success() => Ok(()),
+        Ok(Some(status)) => Err(format!("{cmd} exit {}", status.code().unwrap_or(-1))),
+        Ok(None) => {
+            let _ = (child.kill(), child.wait());
+            Err(format!("{cmd} took over 5 s"))
         }
+        // Such as a child reaped elsewhere, when itse was started with SIGCHLD ignored.
+        Err(e) => Err(format!("{cmd}: {e}")),
     }
 }
 

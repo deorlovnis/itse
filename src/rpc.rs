@@ -85,8 +85,7 @@ pub fn read(r: &mut impl BufRead, f: Framing, max: usize) -> io::Result<Option<V
 /// Write one frame and flush it.
 pub fn write(w: &mut impl Write, f: Framing, v: &Value) -> io::Result<()> {
     let body = v.to_string();
-    let head = if f == Framing::Headers { format!("Content-Length: {}\r\n\r\n", body.len()) } else { String::new() };
-    w.write_all(format!("{head}{body}{}", if f == Framing::Lines { "\n" } else { "" }).as_bytes())?;
+    w.write_all(if f == Framing::Headers { format!("Content-Length: {}\r\n\r\n{body}", body.len()) } else { body + "\n" }.as_bytes())?;
     w.flush()
 }
 

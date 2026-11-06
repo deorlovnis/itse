@@ -145,7 +145,7 @@ fn every_cli_flag_is_reachable_over_mcp() {
     let mut s = Session::new(&host(&tmp, Some(r#"{"mcp": {"debug": true}}"#)), &[]);
     let list = s.rpc("tools/list", json!({}))["result"]["tools"].clone();
     let mut checked = 0;
-    for v in VERBS.iter().filter(|v| v.tool != Tool::CliOnly && v.milestone == Milestone::Built && !v.human_only) {
+    for v in VERBS.iter().filter(|v| v.tool != Tool::CliOnly && !v.human_only) {
         let tool = tool_name(v.tool);
         let schema = &list.as_array().unwrap().iter().find(|t| t["name"] == tool).unwrap()["inputSchema"]["properties"];
         assert!(v.tool == Tool::Show || v.tool == Tool::Debug || schema["verb"]["enum"].as_array().unwrap().contains(&json!(v.name)), "{} is in {tool}'s enum", v.name);

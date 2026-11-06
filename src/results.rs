@@ -90,7 +90,6 @@ pub enum Verdict {
     Untrusted,
     Blocked,
     Unready,
-    Reserved,
 }
 
 /// A located finding: E1 W2 (problems), T3 (tests), S1 (symbols), R4 (references), F1 (frames).
@@ -294,10 +293,8 @@ impl Store {
         if let Some(dir) = run {
             // The runner writes its exit before the daemon parses the output, so give a just-ended
             // run up to 2 s to get its result.json before it's shown unparsed.
-            let end = std::time::Instant::now() + std::time::Duration::from_secs(2);
-            while !dir.join("result.json").exists() && std::time::Instant::now() < end && crate::actions::RunRecord::load(&dir).is_some_and(|r| r.exit.is_some()) {
-                std::thread::sleep(std::time::Duration::from_millis(20));
-            }
+            let settled = || dir.join("result.json").exists() || crate::actions::RunRecord::load(&dir).is_none_or(|r| r.exit.is_none());
+            sys::wait_until(std::time::Duration::from_secs(2), settled);
             if !dir.join("result.json").exists() {
                 return Ok((crate::actions::outcome("run", id, &dir), String::new()));
             }
@@ -305,6 +302,13 @@ impl Store {
         let bytes = self.path(id).and_then(|p| fs::read(p).ok()).ok_or_else(|| anyhow!("{}", text("unknown_id", &[("id", &id)])))?;
         let v: Value = serde_json::from_slice(&bytes).with_context(|| format!("reading {id}"))?;
         Ok((serde_json::from_value(v.clone()).with_context(|| format!("reading {id}"))?, v["session"].as_str().unwrap_or("").into()))
+    }
+
+    /// The numbers of the runs kept, newest first.
+    pub fn runs(&self) -> Vec<u64> {
+        let mut runs: Vec<u64> = fs::read_dir(self.0.join("runs")).into_iter().flatten().flatten().filter_map(|e| e.file_name().to_str()?.parse().ok()).collect();
+        runs.sort_unstable_by(|a, b| b.cmp(a));
+        runs
     }
 
     /// The stored query results, newest first: `(path, bytes)`.
