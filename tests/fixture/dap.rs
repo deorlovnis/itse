@@ -296,8 +296,9 @@ pub fn session(mut input: impl BufRead, out: impl Write, mode: &str) {
     let mut a = Adapter { out, seq: 0, mode: mode.into(), root, stop_at: None, logs: vec![], exceptions: false, stops: vec![], line: 0, launched: None, configured: false, script };
     while let Some(body) = frame(&mut input) {
         let Ok(msg) = serde_json::from_slice::<Value>(&body) else { continue };
+        // One write per line: a test reading the log meanwhile never sees half of one.
         if let Some(mut log) = log.as_ref() {
-            let _ = writeln!(log, "{msg}");
+            let _ = log.write_all(format!("{msg}\n").as_bytes());
         }
         if !a.handle(&msg) {
             return;

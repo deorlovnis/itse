@@ -280,6 +280,27 @@ fn replacing_the_binary_under_a_live_daemon_still_runs_tests() {
     assert_ne!(json!(daemon_pid(&text)), daemon, "with no run left, the next call restarts on the new binary");
 }
 
+/// A FUSE or virtiofs mount can't exec a binary replaced under a live daemon, as tmpfs can: the
+/// runner then starts from a copy in memory, here through the debug-only `ITSE_TEST_EXE_GONE`.
+#[test]
+fn a_binary_the_filesystem_cant_exec_any_more_runs_from_a_copy() {
+    let jobs = Jobs::new(SCRIPTS);
+    let pid = jobs.env.daemon_json()["pid"].as_i64().unwrap() as i32;
+    assert!(jobs.itse(&["daemon", "stop"]).0 == Some(0) && wait_until(Duration::from_secs(5), || !alive(pid)));
+    let gone = |args: &[&str]| {
+        let out = jobs.cmd(ITSE, args).env("ITSE_TEST_EXE_GONE", "1").output().unwrap();
+        (out.status.code(), stdout(&out) + &String::from_utf8_lossy(&out.stderr))
+    };
+    let (code, text) = gone(&["run", "jobs:serve"]);
+    assert_eq!((code, text.lines().next()), (Some(4), Some("RUNNING run jobs:serve — ready ${ready:1}=4711; run:1")), "{text}");
+    let exe = fs::read_link(format!("/proc/{}/exe", jobs.runner(1))).unwrap();
+    assert!(exe.to_string_lossy().starts_with("/memfd:itse"), "{}", exe.display());
+    assert_eq!(fs::read(format!("/proc/{}/cmdline", jobs.runner(1))).unwrap().split(|&b| b == 0).next(), Some(&b"/proc/self/exe"[..]), "the runner's argv0, as before");
+    let (code, text) = gone(&["run", "jobs:hello"]);
+    assert_eq!((code, text.lines().next()), (Some(0), Some("OK run jobs:hello — exit 0; run:2")), "the copy serves the next run too: {text}");
+    assert_eq!(gone(&["cancel", "run:1"]).0, Some(0));
+}
+
 #[test]
 fn an_untrusted_workspace_runs_no_project_code() {
     let jobs = Jobs::new(SCRIPTS);

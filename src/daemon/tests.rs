@@ -167,3 +167,32 @@ fn a_connection_that_talks_but_never_says_hello_is_closed_after_5_s() {
     }
     assert!(started.elapsed() >= HELLO_WAIT && started.elapsed() < HELLO_WAIT + Duration::from_secs(2), "{:?}", started.elapsed());
 }
+
+#[test]
+fn a_socket_chmod_the_filesystem_refuses_is_fine_and_any_other_failure_is_not() {
+    let socket = Path::new("/run/x/itse.sock");
+    let errno = |n| Err(io::Error::from_raw_os_error(n));
+    assert!(private_socket(socket, Ok(())).is_ok());
+    for refused in [1, 22, 95] {
+        assert!(private_socket(socket, errno(refused)).is_ok(), "errno {refused}");
+    }
+    let err = private_socket(socket, errno(13)).unwrap_err();
+    assert_eq!(format!("{err:#}"), "making /run/x/itse.sock 0600: Permission denied (os error 13)");
+}
+
+#[test]
+fn the_socket_is_bound_only_in_a_0700_folder_of_ours() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = TempDir::new("itse-daemon");
+    let socket = tmp.0.join("itse.sock");
+    assert!(private_folder(&socket).is_ok());
+    fs::set_permissions(&tmp.0, fs::Permissions::from_mode(0o750)).unwrap();
+    let err = private_folder(&socket).unwrap_err();
+    let ours = format!("not binding {}: {} is not a 0700 folder of ours", socket.display(), tmp.0.display());
+    assert_eq!(format!("{err:#}"), format!("{ours} (owner {}, mode 750)", crate::sys::uid()));
+    let (private, link) = (TempDir::new("itse-daemon"), tmp.0.join("link"));
+    std::os::unix::fs::symlink(&private.0, &link).unwrap();
+    assert!(private_folder(&link.join("itse.sock")).is_err(), "a link to a folder is not the folder");
+    assert!(private_folder(Path::new("/itse.sock")).is_err(), "nor is / ours");
+    assert!(private_folder(&tmp.0.join("gone/itse.sock")).is_err());
+}

@@ -1,6 +1,7 @@
 //! The workspace daemon: one per workspace, started on demand by the CLI, and
-//! the keeper of warm servers and results. It listens on a 0600 Unix socket and speaks one JSON
-//! value per line: `hello` first, then `call`, `ping` or `shutdown`.
+//! the keeper of warm servers and results. It listens on a Unix socket in a 0700 folder (and 0600
+//! itself, where the filesystem allows), serves our own uid only, and speaks one JSON value per
+//! line: `hello` first, then `call`, `ping` or `shutdown`.
 //!
 //! One instance per workspace is an flock on `daemon.lock`. The main thread ticks: it stops the
 //! daemon on a signal, when idle or when the root is gone, and re-binds a socket someone removed.
@@ -10,7 +11,7 @@
 pub mod client;
 
 use std::fs::{self, OpenOptions, Permissions, TryLockError};
-use std::io::{BufReader, ErrorKind};
+use std::io::{self, BufReader, ErrorKind};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::panic::{self, AssertUnwindSafe};
@@ -49,6 +50,7 @@ pub fn exe_id() -> (u64, u64) {
 pub fn run(ws: Workspace, dirs: Dirs) -> Result<()> {
     sys::limit_arenas();
     sys::catch_signals();
+    sys::keep_exe();
     let (state, socket) = (ws.state_dir(&dirs), ws.socket(&dirs, Path::new("/tmp"))?);
     sys::private_dir(&state)?;
     // A daemon that is shutting down holds the lock for up to 3 s; a live one answers on the socket.
@@ -97,18 +99,58 @@ fn bind(host: &Arc<Host>) -> Result<()> {
     if host.stopping.load(Ordering::SeqCst) {
         return Ok(());
     }
+    private_folder(&host.socket)?;
     let _ = fs::remove_file(&host.socket);
     let listener = UnixListener::bind(&host.socket).with_context(|| format!("binding {}", host.socket.display()))?;
-    fs::set_permissions(&host.socket, Permissions::from_mode(0o600))?;
+    // Debug builds take `ITSE_TEST_SOCKET_CHMOD_ERRNO`, a chmod failure as a FUSE mount gives it.
+    let chmod = match env::var("ITSE_TEST_SOCKET_CHMOD_ERRNO").ok().filter(|_| cfg!(debug_assertions)).and_then(|e| e.parse().ok()) {
+        Some(errno) => Err(io::Error::from_raw_os_error(errno)),
+        None => fs::set_permissions(&host.socket, Permissions::from_mode(0o600)),
+    };
+    if let Err(e) = private_socket(&host.socket, chmod) {
+        let _ = fs::remove_file(&host.socket);
+        return Err(e);
+    }
     *bound = fs::symlink_metadata(&host.socket).map_or(0, |m| m.ino());
     let host = host.clone();
     thread::spawn(move || {
         // A stop wakes this loop, which drops the listener: connections still queued see EOF.
         for (conn, host) in listener.incoming().flatten().take_while(|_| !host.stopping.load(Ordering::SeqCst)).map(|c| (c, host.clone())) {
-            thread::spawn(move || serve_conn(conn, &host));
+            match sys::peer_uid(&conn) {
+                Ok(uid) if uid == sys::uid() => drop(thread::spawn(move || serve_conn(conn, &host))),
+                peer => eprintln!("itse daemon: refused a connection from {}", peer.map_or_else(|e| format!("an unknown user ({e})"), |uid| format!("uid {uid}"))),
+            }
         }
     });
     Ok(())
+}
+
+/// Every bind, the first and a re-bind, is into a 0700 folder of ours, not a link: connecting needs
+/// search permission on the folder, so it is what keeps the socket private. Peers of another uid
+/// are refused too, for a FUSE mount that checks no modes at all (allow_other without
+/// default_permissions).
+fn private_folder(socket: &Path) -> Result<()> {
+    let dir = socket.parent().unwrap_or(Path::new("/"));
+    let meta = fs::symlink_metadata(dir).with_context(|| format!("reading {}", dir.display()))?;
+    if !meta.is_dir() || meta.uid() != sys::uid() || meta.mode() & 0o077 != 0 {
+        bail!("not binding {}: {} is not a 0700 folder of ours (owner {}, mode {:o})", socket.display(), dir.display(), meta.uid(), meta.mode() & 0o777);
+    }
+    Ok(())
+}
+
+/// The socket is made 0600 as well, but FUSE and virtiofs mounts refuse a chmod on a socket (EINVAL;
+/// other filesystems say ENOTSUP or EPERM). There it has whatever mode the filesystem gives it,
+/// whatever the umask (0755 or 0666 on virtiofs), and its folder alone keeps it private. Any other
+/// failure fails closed. No umask change instead: the umask is process-wide, and would not set the
+/// mode there anyway; other threads create files while a removed socket is re-bound.
+fn private_socket(socket: &Path, chmod: io::Result<()>) -> Result<()> {
+    const EPERM: i32 = 1;
+    const EINVAL: i32 = 22;
+    const ENOTSUP: i32 = 95;
+    match chmod {
+        Err(e) if !matches!(e.raw_os_error(), Some(EPERM | EINVAL | ENOTSUP)) => Err(e).with_context(|| format!("making {} 0600", socket.display())),
+        _ => Ok(()),
+    }
 }
 
 /// Stop taking connections: wake the accept loop so it drops the listener, and unlink the socket,

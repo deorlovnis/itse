@@ -30,7 +30,7 @@ pub fn run(args: &[String], mode: &str) -> ExitCode {
     }
     let line = json!({"tool": name, "argv": argv, "cwd": env::current_dir().unwrap_or_default()}).to_string();
     if let Some(log) = env::var_os("ITSE_FIXTURE_LOG") {
-        let _ = OpenOptions::new().create(true).append(true).open(log).and_then(|mut f| writeln!(f, "{line}"));
+        let _ = OpenOptions::new().create(true).append(true).open(log).and_then(|mut f| f.write_all(format!("{line}\n").as_bytes()));
     }
     match name.as_str() {
         "curl" => curl(argv),

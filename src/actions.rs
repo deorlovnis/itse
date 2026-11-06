@@ -6,11 +6,11 @@
 //! runner adds its pid and then the exit, each time atomically. The env is never written: it goes
 //! on the runner's `Command` only.
 
-use std::os::unix::{fs::OpenOptionsExt, process::ExitStatusExt};
+use std::os::unix::{fs::OpenOptionsExt, process::CommandExt, process::ExitStatusExt};
 use std::process::{self, Child, Command, ExitStatus, Stdio};
 use std::sync::{Arc, Condvar, Mutex, PoisonError, atomic::AtomicBool, atomic::Ordering::SeqCst};
 use std::{
-    collections::BTreeMap, env, fs, fs::File, fs::OpenOptions, io::Read, io::Write, path::Path, path::PathBuf, thread, time::Duration, time::Instant, time::SystemTime,
+    collections::BTreeMap, env, fs, fs::File, fs::OpenOptions, io, io::Read, io::Write, path::Path, path::PathBuf, thread, time::Duration, time::Instant, time::SystemTime,
     time::UNIX_EPOCH,
 };
 
@@ -162,9 +162,20 @@ pub fn start(host: &Arc<Host>, label: &str, plan: &Plan, env: &BTreeMap<String, 
     let deadline_ms = plan.timeout_s.map(|s| started_ms + s * 1000);
     let spec = RunSpec { steps: plan.steps.clone(), limits: Limits::default(), label: label.into(), started_at: started_at.clone(), started_ms, deadline_ms };
     RunRecord { spec, ..RunRecord::default() }.save(&dir)?;
-    let (mut cmd, log) = (Command::new("/proc/self/exe"), OpenOptions::new().create(true).append(true).mode(0o600).open(dir.join("out.log"))?);
-    cmd.arg("__run").arg(&dir).env_clear().envs(env).current_dir(&dir).stdin(Stdio::null()).stdout(log.try_clone()?).stderr(log);
-    let child = host::spawn(&mut cmd, &Limits::default(), true, 500).map_err(|e| anyhow!("starting the runner: {e}"))?;
+    let log = OpenOptions::new().create(true).append(true).mode(0o600).open(dir.join("out.log"))?;
+    let spawn = |program: &Path| {
+        let mut cmd = Command::new(program);
+        cmd.arg0("/proc/self/exe").arg("__run").arg(&dir).env_clear().envs(env).current_dir(&dir).stdin(Stdio::null()).stdout(log.try_clone()?).stderr(log.try_clone()?);
+        host::spawn(&mut cmd, &Limits::default(), true, 500)
+    };
+    // A FUSE or virtiofs mount can't exec this binary once it is replaced; debug builds take
+    // `ITSE_TEST_EXE_GONE` to act as if it were.
+    let gone = env::var_os("ITSE_TEST_EXE_GONE").filter(|_| cfg!(debug_assertions)).is_some();
+    let child = match if gone { Err(io::ErrorKind::NotFound.into()) } else { spawn(Path::new("/proc/self/exe")) } {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => sys::exe_copy().and_then(|copy| spawn(&copy)),
+        started => started,
+    };
+    let child = child.map_err(|e| anyhow!("starting the runner: {e}"))?;
     let (pid, start_time) = (child.id() as i32, sys::proc_stat(child.id() as i32).map_or(0, |s| s.start_time));
     let record = json!({"handle": handle, "kind": "run", "pid": pid, "pgid": pid, "start_time": start_time, "argv0": label, "started_at": started_at, "log": dir.join("out.log")});
     let run = Arc::new(Run { handle, dir, pgid: pid, start_time, ..Run::default() });
