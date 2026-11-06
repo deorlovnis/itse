@@ -2,11 +2,13 @@
 //!
 //! Each test gets a private HOME and XDG dirs under /tmp/itse-e2e-<pid>-<n> (short, for sun_path),
 //! with XDG_RUNTIME_DIR removed, so nothing touches the real ~/.config/itse or ~/.local/state/itse.
+//! `ITSE_E2E_ROOT=<dir>` puts those folders under `<dir>` instead, to run the suite on another
+//! filesystem (a FUSE or virtiofs mount, say), the test binary's copies included; keep `<dir>` short.
 //! Daemons idle out after 2 s, and each test's `Env` stops every daemon it started when dropped.
 //! `Mcp` drives `itse mcp` the way a harness does, over the relay's stdio.
 
 use std::io::{BufRead, BufReader, Read, Write};
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Output, Stdio};
@@ -23,17 +25,20 @@ const FIXTURE: &str = env!("CARGO_BIN_EXE_itse-fixture");
 /// then kills the group of any that is left, and removes the folder.
 struct Env {
     dir: PathBuf,
+    /// XDG_STATE_HOME: `<dir>/state`, or elsewhere for a test of another filesystem.
+    state: PathBuf,
 }
 
 impl Env {
     fn new() -> Self {
         static COUNT: AtomicUsize = AtomicUsize::new(0);
-        let dir = PathBuf::from(format!("/tmp/itse-e2e-{}-{}", process::id(), COUNT.fetch_add(1, Ordering::Relaxed)));
+        let root = std::env::var_os("ITSE_E2E_ROOT").map_or_else(|| PathBuf::from("/tmp"), PathBuf::from);
+        let dir = root.join(format!("itse-e2e-{}-{}", process::id(), COUNT.fetch_add(1, Ordering::Relaxed)));
         let _ = fs::remove_dir_all(&dir);
         for sub in ["home", "config", "data", "state", "cache", "work"] {
             fs::create_dir_all(dir.join(sub)).unwrap();
         }
-        Self { dir }
+        Self { state: dir.join("state"), dir }
     }
 
     fn work(&self) -> PathBuf {
@@ -56,7 +61,7 @@ impl Env {
             .env("HOME", self.dir.join("home"))
             .env("XDG_CONFIG_HOME", self.dir.join("config"))
             .env("XDG_DATA_HOME", self.dir.join("data"))
-            .env("XDG_STATE_HOME", self.dir.join("state"))
+            .env("XDG_STATE_HOME", &self.state)
             .env("XDG_CACHE_HOME", self.dir.join("cache"))
             .env("TMPDIR", &self.dir)
             .env("ITSE_DAEMON_IDLE_S", "2")
@@ -67,13 +72,15 @@ impl Env {
             .env_remove("ITSE_TEST_SLOW_MS")
             .env_remove("ITSE_TEST_SETTLE_MS")
             .env_remove("ITSE_TEST_STOP_MS")
+            .env_remove("ITSE_TEST_SOCKET_CHMOD_ERRNO")
+            .env_remove("ITSE_TEST_EXE_GONE")
             .stdin(Stdio::null());
         cmd
     }
 
     /// The state folder of each workspace that ever had a daemon: `(ws dir, daemon.json if present)`.
     fn daemons(&self) -> Vec<(PathBuf, Value)> {
-        let Ok(dirs) = fs::read_dir(self.dir.join("state/itse/ws")) else { return vec![] };
+        let Ok(dirs) = fs::read_dir(self.state.join("itse/ws")) else { return vec![] };
         let read = |p: PathBuf| fs::read(p).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or(Value::Null);
         dirs.flatten().map(|d| (d.path(), read(d.path().join("daemon.json")))).collect()
     }
@@ -106,8 +113,10 @@ impl Drop for Env {
             }
         }
         // The store is read-only; u+w comes back first so the folder can go.
-        let _ = Command::new("chmod").args(["-R", "u+w"]).arg(&self.dir).status();
-        let _ = fs::remove_dir_all(&self.dir);
+        for dir in [&self.dir].into_iter().chain(Some(&self.state).filter(|s| !s.starts_with(&self.dir))) {
+            let _ = Command::new("chmod").args(["-R", "u+w"]).arg(dir).status();
+            let _ = fs::remove_dir_all(dir);
+        }
     }
 }
 
@@ -247,7 +256,9 @@ fn the_first_command_starts_the_daemon_and_the_second_reuses_it() {
     assert_eq!((info["pid"].as_i64(), info["proto"].as_u64(), info["started_by"].as_str()), (Some(first.into()), Some(1), Some("cli")));
     assert_eq!(info["root"], json!(env.work()));
     let socket = env.socket();
-    assert_eq!(fs::metadata(&socket).unwrap().mode() & 0o777, 0o600);
+    // Under ITSE_E2E_ROOT on a FUSE mount the socket can't be made 0600; its 0700 folder guards it.
+    let mode = fs::metadata(&socket).unwrap().mode() & 0o777;
+    assert!(mode == 0o600 || fs::set_permissions(&socket, fs::Permissions::from_mode(0o600)).is_err(), "{mode:o}");
     assert_eq!(fs::metadata(socket.parent().unwrap()).unwrap().mode() & 0o777, 0o700);
 }
 
@@ -328,6 +339,76 @@ fn a_removed_socket_is_rebound() {
     fs::remove_file(&socket).unwrap();
     assert!(wait_until(Duration::from_secs(2), || socket.exists()));
     assert_eq!(env.status_pid(), pid);
+}
+
+/// A re-bind goes into a 0700 folder of ours or nowhere, whether or not the socket's chmod works.
+#[test]
+fn a_removed_socket_is_not_rebound_into_a_folder_others_can_enter() {
+    let env = Env::new();
+    let pid = env.status_pid();
+    let socket = env.socket();
+    let (dir, log) = (socket.parent().unwrap(), env.daemons()[0].0.join("daemon.log"));
+    fs::set_permissions(dir, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::remove_file(&socket).unwrap();
+    let refused = format!("re-binding the socket: not binding {}: {} is not a 0700 folder of ours", socket.display(), dir.display());
+    assert!(wait_until(Duration::from_secs(2), || fs::read_to_string(&log).unwrap_or_default().contains(&refused)), "{}", fs::read_to_string(&log).unwrap_or_default());
+    assert!(!socket.exists() && alive(pid));
+    fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(wait_until(Duration::from_secs(2), || socket.exists()), "a private folder again: re-bound");
+    assert_eq!(env.status_pid(), pid);
+}
+
+/// FUSE and virtiofs mounts refuse a chmod on a socket (EINVAL), here through the debug-only seam:
+/// the daemon starts and re-binds all the same, in its 0700 folder.
+#[test]
+fn a_socket_chmod_the_filesystem_refuses_still_starts_the_daemon() {
+    let env = Env::new();
+    let out = env.command(&env.work(), &["status"]).env("ITSE_TEST_SOCKET_CHMOD_ERRNO", "22").output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let (pid, socket) = (daemon_pid(&stdout(&out)), env.socket());
+    assert_eq!(fs::metadata(socket.parent().unwrap()).unwrap().mode() & 0o777, 0o700);
+    fs::remove_file(&socket).unwrap();
+    assert!(wait_until(Duration::from_secs(2), || socket.exists()), "the re-bind takes the same path");
+    assert_eq!(env.status_pid(), pid);
+}
+
+#[test]
+fn any_other_socket_chmod_failure_keeps_the_daemon_from_starting() {
+    let env = Env::new();
+    let out = env.command(&env.work(), &["status"]).env("ITSE_TEST_SOCKET_CHMOD_ERRNO", "13").output().unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    let (err, socket) = (String::from_utf8_lossy(&out.stderr), env.socket());
+    assert!(err.starts_with("itse: the daemon didn't start (see ") && err.contains(&format!("making {} 0600: Permission denied (os error 13)", socket.display())), "{err}");
+    assert!(!socket.exists(), "no socket is left behind");
+}
+
+/// `ITSE_E2E_FUSE_DIR=<dir>`, a folder on a FUSE or virtiofs mount: the daemon with its state there
+/// starts, re-binds a removed socket, serves `itse mcp` and stops. `ITSE_E2E_ROOT` runs every test
+/// on such a mount.
+#[test]
+#[ignore = "needs a folder on a FUSE or virtiofs mount: ITSE_E2E_FUSE_DIR=<dir>"]
+fn the_daemon_serves_with_its_state_on_a_fuse_mount() {
+    let Some(fuse) = std::env::var_os("ITSE_E2E_FUSE_DIR") else {
+        return eprintln!("skipped: ITSE_E2E_FUSE_DIR=<dir> runs it");
+    };
+    let mut env = Env::new();
+    env.state = PathBuf::from(fuse).join(env.dir.file_name().unwrap());
+    let longest = env.state.join("itse/ws/0123456789ab/itse.sock");
+    assert!(longest.as_os_str().len() <= 107, "{} would put the socket in /tmp; use a shorter ITSE_E2E_FUSE_DIR", longest.display());
+    let pid = env.status_pid();
+    let socket = env.socket();
+    assert!(socket.exists() && socket.starts_with(&env.state));
+    assert_eq!(fs::metadata(socket.parent().unwrap()).unwrap().mode() & 0o777, 0o700);
+    fs::remove_file(&socket).unwrap();
+    assert!(wait_until(Duration::from_secs(2), || socket.exists()), "the socket is re-bound");
+    assert_eq!(env.status_pid(), pid);
+    let mut mcp = env.mcp(&[]);
+    mcp.handshake("e2e");
+    let (is_error, text) = mcp.call("problems_symbols", json!({"verb": "status"}));
+    assert!(!is_error && text.starts_with(&format!("OK status {} — daemon pid {pid}", env.work().display())), "{text}");
+    assert_eq!(mcp.close(), (Some(0), String::new()));
+    assert!(env.itse(&env.work(), &["daemon", "stop"]).status.success());
+    assert!(wait_until(Duration::from_secs(5), || !alive(pid)));
 }
 
 #[test]

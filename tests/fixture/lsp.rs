@@ -104,8 +104,9 @@ pub fn serve(mode: &str) -> ExitCode {
     };
     while let Some(body) = frame(&mut stdin) {
         let Ok(msg) = serde_json::from_slice::<Value>(&body) else { continue };
+        // One write per line: a test reading the log meanwhile never sees half of one.
         if let Some(log) = &log {
-            let _ = writeln!(log.lock().unwrap_or_else(|e| e.into_inner()), "{msg}");
+            let _ = log.lock().unwrap_or_else(|e| e.into_inner()).write_all(format!("{msg}\n").as_bytes());
         }
         let (id, p, method) = (msg["id"].clone(), &msg["params"], msg["method"].as_str().unwrap_or(""));
         let doc = &p["textDocument"];

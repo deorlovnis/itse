@@ -9,7 +9,7 @@ use std::process::{self, Command, Stdio};
 use std::time::{Duration, Instant};
 use std::{env, fs, thread};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Value, json};
 
 use super::{HELLO_WAIT, VERSION, exe_id, proto};
@@ -54,6 +54,9 @@ pub fn connect(ws: &Workspace, dirs: &Dirs, mode: &str) -> Result<Conn> {
             Err(e) if matches!(e.kind(), ErrorKind::NotFound | ErrorKind::ConnectionRefused) => start(ws, dirs, mode, &socket)?,
             stream => stream.with_context(|| format!("connecting to {}", socket.display()))?,
         };
+        // The hello carries the env: only to a daemon of ours.
+        let peer = sys::peer_uid(&stream).with_context(|| format!("asking who serves {}", socket.display()))?;
+        ensure!(peer == sys::uid(), "{} is served by uid {peer}, not by us; no hello is sent", socket.display());
         let mut reader = BufReader::new(stream);
         let reason = match ask(&mut reader, "hello", hello.clone(), Some(HELLO_WAIT)) {
             Err(RpcError::Remote { code: -32003, .. }) => "proto",

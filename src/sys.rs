@@ -1,15 +1,17 @@
 //! The few things Itse needs from the OS beyond std: libc calls declared by hand, process state
 //! from /proc, private folders and files, random bytes, and UTC timestamps.
 //!
-//! No libc crate (as Halti): six calls with Linux constants, each behind a small safe function.
+//! No libc crate (as Halti): eight calls with Linux constants, each behind a small safe function.
 
-use std::fs::{self, OpenOptions};
-use std::io::{self, Read, Write};
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, ErrorKind, Read, Seek, SeekFrom, Write};
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use std::{env, process, thread};
 
@@ -29,6 +31,9 @@ pub const RLIMIT_AS: i32 = 9;
 const M_ARENA_MAX: i32 = -8;
 /// An `open` flag: a FIFO opens at once instead of waiting for a writer.
 pub const O_NONBLOCK: i32 = 0o4000;
+const SOL_SOCKET: i32 = 1;
+const SO_PEERCRED: i32 = 17;
+const MFD_CLOEXEC: u32 = 1;
 
 mod ffi {
     unsafe extern "C" {
@@ -38,6 +43,8 @@ mod ffi {
         pub fn getuid() -> u32;
         pub fn signal(sig: i32, handler: usize) -> usize;
         pub fn mallopt(param: i32, value: i32) -> i32;
+        pub fn getsockopt(fd: i32, level: i32, name: i32, value: *mut [u32; 3], len: *mut u32) -> i32;
+        pub fn memfd_create(name: *const std::ffi::c_char, flags: u32) -> i32;
     }
 }
 
@@ -63,6 +70,46 @@ pub fn set_rlimit(resource: i32, value: u64) -> io::Result<()> {
 pub fn uid() -> u32 {
     // SAFETY: getuid can't fail and touches no memory of ours.
     unsafe { ffi::getuid() }
+}
+
+/// The uid at the other end of a Unix socket, as the kernel took it at connect (for a client: at
+/// the daemon's listen).
+pub fn peer_uid(stream: &UnixStream) -> io::Result<u32> {
+    let (mut cred, mut len) = ([0u32; 3], 12);
+    // SAFETY: the pointers are to a live [u32; 3] (struct ucred: pid, uid, gid) and its length.
+    if unsafe { ffi::getsockopt(stream.as_raw_fd(), SOL_SOCKET, SO_PEERCRED, &mut cred, &mut len) } < 0 { Err(io::Error::last_os_error()) } else { Ok(cred[1]) }
+}
+
+static EXE: OnceLock<Option<File>> = OnceLock::new();
+
+/// Open the running binary, at daemon start, so `exe_copy` can still read it once it is replaced.
+pub fn keep_exe() {
+    EXE.get_or_init(|| File::open("/proc/self/exe").ok());
+}
+
+/// A path that runs a copy, in memory, of the binary `keep_exe` opened, made on the first call. A
+/// FUSE or virtiofs mount can't exec (nor open) a binary that was unlinked, replaced, while it runs;
+/// tmpfs and ext4 can, through `/proc/self/exe`. The fd is close-on-exec: the kernel opens the
+/// path before it closes the fds, and the runner keeps no copy of it.
+pub fn exe_copy() -> io::Result<PathBuf> {
+    static COPY: Mutex<Option<File>> = Mutex::new(None);
+    let mut copy = lock(&COPY);
+    if copy.is_none() {
+        let mut exe = EXE.get().and_then(Option::as_ref).ok_or_else(|| io::Error::new(ErrorKind::NotFound, "the binary was not kept open"))?;
+        // SAFETY: the name is a NUL-terminated literal.
+        let fd = unsafe { ffi::memfd_create(c"itse".as_ptr(), MFD_CLOEXEC) };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: the fd is new, and nothing else owns or closes it.
+        let mem = unsafe { File::from_raw_fd(fd) };
+        exe.seek(SeekFrom::Start(0))?;
+        io::copy(&mut exe, &mut &mem)?;
+        mem.set_permissions(fs::Permissions::from_mode(0o500))?;
+        // Read-only from here, so no writable fd is open when it is exec'd.
+        *copy = Some(File::open(format!("/proc/self/fd/{}", mem.as_raw_fd()))?);
+    }
+    Ok(PathBuf::from(format!("/proc/{}/fd/{}", process::id(), copy.as_ref().map_or(-1, AsRawFd::as_raw_fd))))
 }
 
 static SIGNALLED: AtomicBool = AtomicBool::new(false);
@@ -456,5 +503,23 @@ pub mod tests {
         assert!(m.is_poisoned());
         *lock(&m) += 1;
         assert_eq!(*lock(&m), 2);
+    }
+
+    #[test]
+    fn the_peer_of_a_socket_of_ours_is_us() {
+        let (a, b) = UnixStream::pair().unwrap();
+        assert_eq!((peer_uid(&a).unwrap(), peer_uid(&b).unwrap()), (uid(), uid()));
+    }
+
+    #[test]
+    fn the_copy_of_the_binary_runs_and_is_made_once() {
+        keep_exe();
+        let copy = exe_copy().unwrap();
+        assert_eq!(exe_copy().unwrap(), copy);
+        assert!(fs::read_link(&copy).unwrap().to_string_lossy().starts_with("/memfd:itse"), "{}", copy.display());
+        assert_eq!(fs::metadata(&copy).unwrap().mode() & 0o777, 0o500);
+        // This test binary, run again from the copy, lists one test.
+        let out = Command::new(&copy).args(["--list", "--exact", "sys::tests::the_copy_of_the_binary_runs_and_is_made_once"]).output().unwrap();
+        assert!(out.status.success() && String::from_utf8_lossy(&out.stdout).starts_with("sys::tests::the_copy_of_the_binary_runs_and_is_made_once: test"), "{out:?}");
     }
 }
