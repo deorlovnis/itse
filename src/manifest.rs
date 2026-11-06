@@ -497,7 +497,7 @@ pub struct Use {
 /// worktree's team layer.
 pub struct Manifest {
     /// The built-ins, and the extensions added with `itse ext add` (an added one replaces a built-in).
-    pub exts: BTreeMap<String, (Extension, &'static str)>,
+    pub exts: Exts,
     pub dev: Option<(PathBuf, Layer)>,
     pub team: Option<Layer>,
     /// The team-layer files' bytes, for the trust hash; empty without a team layer.
@@ -505,20 +505,30 @@ pub struct Manifest {
     pub notes: Vec<String>,
 }
 
+/// Extensions by id, each with where it comes from: `built-in` or `added`.
+pub type Exts = BTreeMap<String, (Extension, &'static str)>;
+
+/// The extensions on offer: the built-ins, and those added with `itse ext add` whose file still has
+/// the recorded hash (an added one replaces a built-in); with a note for each file that doesn't.
+pub fn extensions(dirs: &Dirs) -> Result<(Exts, Vec<String>)> {
+    let mut exts = BTreeMap::new();
+    for (id, text) in BUILT_INS {
+        exts.insert(id.to_string(), (parse_ext(text, &format!("built-in {id}"))?, "built-in"));
+    }
+    let (added, mut notes) = (lock::added(dirs)?, Vec::new());
+    for path in json_files(&dirs.config.join("extensions")) {
+        let (id, bytes) = (path.file_stem().unwrap_or_default().to_string_lossy().into_owned(), fs::read(&path)?);
+        match added.get(&id) {
+            Some(rec) if rec.sha256 == sys::sha256_hex(&bytes) => drop(exts.insert(id, (parse_ext(&String::from_utf8_lossy(&bytes), &path.display().to_string())?, "added"))),
+            _ => notes.push(format!("{} is not loaded: it differs from what 'itse ext add' recorded", path.display())),
+        }
+    }
+    Ok((exts, notes))
+}
+
 impl Manifest {
     pub fn load(ws: &Workspace, dirs: &Dirs) -> Result<Self> {
-        let mut exts = BTreeMap::new();
-        for (id, text) in BUILT_INS {
-            exts.insert(id.to_string(), (parse_ext(text, &format!("built-in {id}"))?, "built-in"));
-        }
-        let (added, mut notes) = (lock::added(dirs)?, Vec::new());
-        for path in json_files(&dirs.config.join("extensions")) {
-            let (id, bytes) = (path.file_stem().unwrap_or_default().to_string_lossy().into_owned(), fs::read(&path)?);
-            match added.get(&id) {
-                Some(rec) if rec.sha256 == sys::sha256_hex(&bytes) => drop(exts.insert(id, (parse_ext(&String::from_utf8_lossy(&bytes), &path.display().to_string())?, "added"))),
-                _ => notes.push(format!("{} is not loaded: it differs from what 'itse ext add' recorded", path.display())),
-            }
-        }
+        let (exts, notes) = extensions(dirs)?;
         let team_dir = ws.root.join(".itse");
         let (json, lock) = (fs::read(team_dir.join("itse.json")).ok(), fs::read(team_dir.join("itse.lock.json")).ok());
         let team = json.as_deref().map(|b| serde_json::from_slice::<Layer>(b).with_context(|| format!("team layer {}", team_dir.join("itse.json").display()))).transpose()?;
@@ -690,7 +700,6 @@ pub fn ext(ws: &Workspace, dirs: &Dirs, cwd: &Path, args: &Args, actor: &str) ->
             ensure!(lock::record_removed(dirs, &arg)? | fs::remove_file(&path).is_ok(), "no added extension '{arg}'; built-ins can't be removed");
             vec![format!("removed {arg} by {actor}")]
         }
-        "tools" => bail!("ext tools arrives with hosted MCP servers"),
         other => bail!("unexpected argument '{other}'; 'ext' takes list, show, tools, add or remove"),
     };
     let scope = [args.target.as_deref().unwrap_or("list"), &arg].join(" ").trim_end().to_string();

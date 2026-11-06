@@ -82,6 +82,8 @@ fn run() -> Result<u8> {
         Cmd::Version => return Ok(print(format!("itse {}\n", env!("CARGO_PKG_VERSION")), 0)),
         Cmd::Help => return Ok(print(help(), 0)),
         Cmd::Verb(verb, args) if verb.name == "__run" => return actions::runner(Path::new(args.target.as_deref().unwrap_or_default())),
+        // Its workspace is the edited file's, and it always exits 0.
+        Cmd::Verb(verb, args) if verb.name == "hook" => return Ok(verbs::harness::hook(args.target.as_deref().unwrap_or_default())),
         Cmd::Verb(verb, args) => (verb, args),
     };
     let given = root.or_else(|| var_os("ITSE_WORKSPACE").filter(|v| !v.is_empty()).map(PathBuf::from));
@@ -94,19 +96,19 @@ fn run() -> Result<u8> {
         ("daemon", Some("status")) => println!("{}", verbs::daemon_status(&ws, &dirs)),
         ("daemon", Some("restart")) => {
             verbs::stop_daemon(&ws, &dirs)?;
-            println!("daemon pid {} started", client::connect(&ws, &dirs, "cli")?.1["pid"]);
+            println!("daemon pid {} started", client::connect(&ws, &dirs, "cli", &[])?.1["pid"]);
         }
         ("daemon", Some(other)) => bail!("unexpected argument '{other}'; 'daemon' takes stop, restart or status"),
         ("mcp", _) => return mcp::relay::run(&ws, &dirs),
         ("env" | "exec", _) => return env::cli(&ws, &dirs, &args, verb.name == "exec"),
         ("stats", _) => return Ok(print(usage::stats(&dirs, &args, &mcp::offered())?, 0)),
-        ("verbs" | "use" | "unuse", _) => {
-            let (text, exit) = verbs::local(&usage::Usage::new(&dirs, &ws.root, false), &ws, &dirs, verb, &args);
+        ("verbs" | "use" | "unuse" | "integrate", _) => {
+            let (text, exit) = verbs::local(&usage::Usage::new(&dirs, &ws.root, false), &ws, &dirs, verb, &args, io::stdin().is_terminal());
             return Ok(print(text, exit));
         }
         (name, _) if verb.runs == Runs::Local => bail!("'{name}' is not built yet"),
         (name, _) => {
-            let conn = client::connect(&ws, &dirs, "cli")?;
+            let conn = client::connect(&ws, &dirs, "cli", &[])?;
             let (text, exit) = client::call(conn, json!({"verb": name, "args": args, "json": false, "page": 1, "wait": 100, "tty": io::stdin().is_terminal()}))?;
             return Ok(print(text, exit));
         }

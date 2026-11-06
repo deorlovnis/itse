@@ -11,16 +11,16 @@
 
 use std::os::unix::{ffi::OsStrExt, fs::MetadataExt, fs::OpenOptionsExt};
 use std::{collections::BTreeMap, collections::BTreeSet, sync::Arc, sync::Condvar, sync::Mutex, sync::PoisonError, time::Duration, time::Instant, time::SystemTime};
-use std::{ffi::OsStr, fs, fs::File, fs::OpenOptions, io::BufReader, io::Read, io::Write, path::Path, path::PathBuf, process};
+use std::{ffi::OsStr, fs, fs::File, fs::OpenOptions, io::Read, io::Write, path::Path, path::PathBuf, process};
 
-use anyhow::{Result, anyhow, bail, ensure};
+use anyhow::{Result, anyhow, ensure};
 use serde_json::{Value, json};
 
-use crate::host::{Crash, Host, Launch, Live, Phase, Protocol, Server, Slot};
+use crate::host::{Host, Launch, Live, Protocol, Server, Slot};
 use crate::manifest::Server as Declared;
 use crate::results::{Item, Loc, Outcome, State, Store, Verdict, text};
 use crate::rpc::{Cancel, Dialect, Framing, Handler, Peer, RpcError};
-use crate::{env, parse, resolve, store, sys, sys::lock};
+use crate::{parse, resolve, sys, sys::lock};
 
 /// Diagnostics kept per server, over all its files; the rest are counted for `status`.
 const MAX_DIAGS: usize = 2000;
@@ -662,67 +662,28 @@ impl Ask {
     }
 }
 
-/// The launch's hash, as `Server::hash`.
-fn launch_hash(l: &Launch) -> String {
-    sys::sha256_hex(format!("{l:?}").as_bytes())[..12].to_string()
-}
-
-/// A server left running from a launch that has changed since.
-fn changed(s: &Server, l: &Launch) -> Option<String> {
-    (s.hash != launch_hash(l)).then(|| format!("config changed; 'itse stop lsp:{}' to apply", l.id))
-}
-
 /// `lsp:<id>` up for a query, started on demand by the first caller while the others wait for it,
-/// unless `start` is false: then None if it isn't up. One found ended leaves `procs.json` here.
+/// unless `start` is false: then None if it isn't up.
 fn ask(host: &Arc<Host>, l: &Launch, env: &BTreeMap<String, String>, start: bool, cancel: &Cancel) -> Result<Option<Ask>> {
-    let handle = format!("lsp:{}", l.id);
-    let slot = host.slot(&handle);
-    let (up, ended) = slot.get();
-    ended.inspect(|&pid| host.untrack(&handle, pid));
-    let (server, note, fresh) = match up {
-        Some(server) => (server, None, false),
-        None if !start => return Ok(None),
-        None => slot.up(|| self::start(host, &slot, l, env), cancel)?,
-    };
+    let Some(up) = host.ask("lsp", l, start, cancel, |slot| self::start(host, slot, l, env))? else { return Ok(None) };
     let (root, git) = (host.ws.root.clone(), host.ws.git);
     // A declared output the server makes when it is missing, such as rust-analyzer's Cargo.lock.
     let makes = l.outputs.iter().filter(|o| !o.ends_with('/') && !root.join(o).exists()).map(|o| format!("{} may write {o} into the workspace (a declared output)", l.id));
-    let notes = note.map(|n| format!("{} {n}", l.id)).into_iter().chain(changed(&server, l)).chain(makes).collect();
-    Ok(Some(Ask { handle, peer: server.peer.clone(), slot, root, git, launch: l.clone(), notes, epoch: server.epoch, _held: Some(server), fresh }))
+    let notes = up.notes.into_iter().chain(makes).collect();
+    let (peer, epoch) = (up.server.peer.clone(), up.server.epoch);
+    Ok(Some(Ask { handle: up.handle, peer, slot: up.slot, root, git, launch: l.clone(), notes, epoch, _held: Some(up.server), fresh: up.fresh }))
 }
 
-/// Spawn the server in its own group, stderr to `servers/<id>.log` (the last start's kept as
-/// `<id>.log.1`, so a crash's tail is this start's; the daemon starts it afresh past 4 MB), and
-/// `initialize` it. It is in `procs.json` from the spawn on, with the `ITSE_SERVER` marker its env
-/// passes down to what it starts, so a daemon that dies during a long `initialize` leaves nothing
-/// behind; the marker is the one `ITSE_*` var a server gets. A server that ends or fails before
-/// `initialize` answers has its group and its marked processes killed, and says how.
+/// Start the server over the host's shared start, with LSP's headers and `initialize`; the
+/// documents the queries opened start afresh with it.
 fn start(host: &Host, slot: &Slot, l: &Launch, env: &BTreeMap<String, String>) -> Result<Server> {
-    // Before the log turns over, so a server that can't start leaves the last real logs as they were.
-    ensure!(!l.argv.is_empty(), "{} has no command", l.id);
-    let (dir, handle) = (host.ws.state_dir(&host.dirs).join("servers"), format!("lsp:{}", l.id));
-    sys::private_dir(&dir)?;
-    let log = dir.join(format!("{}.log", l.id));
-    let _ = fs::rename(&log, dir.join(format!("{}.log.1", l.id)));
-    let marker = format!("{}-{}", process::id(), sys::hex(&sys::random_bytes::<8>()?));
-    let (mut child, file) = host.spawn_as(&handle, "lsp", l, &l.argv, env, &log, &marker, true)?;
-    // Only the one start under way changes the epoch.
-    let epoch = lock(&slot.live).epoch + 1;
-    *lock(&slot.live) = Live { epoch, ..Live::default() };
-    *lock(&slot.docs) = Docs { epoch, ..Docs::default() };
     let folders = json!([{"uri": uri(&host.ws.root), "name": host.ws.root.file_name().unwrap_or_default().to_string_lossy()}]);
-    let reader = Reader { live: slot.live.clone(), woke: slot.woke.clone(), epoch, settings: l.settings.clone(), folders: folders.clone(), log: Some(Mutex::new(file)) };
-    let (Some(stdout), Some(stdin)) = (child.stdout.take(), child.stdin.take()) else { bail!("{} has no stdio", l.id) };
-    let peer = Peer::start(BufReader::new(stdout), stdin, Framing::Headers, Dialect::Lsp, Arc::new(reader));
-    let secs = std::env::var("ITSE_SERVER_IDLE_S").ok().and_then(|s| s.parse().ok());
-    let idle = Duration::from_secs(secs.unwrap_or_else(|| l.idle_minutes.or(host.config().server_idle_minutes).unwrap_or(30) * 60));
-    let server = Server { peer, child: Mutex::new(child), exit_codes: l.exit_codes.clone(), log, idle, hash: launch_hash(l), marker, epoch };
-    if let Err(e) = initialize(&server.peer, slot, l, &host.ws.root, folders) {
-        let ended = host.kill_child(&handle, &mut lock(&server.child), &server.marker).map(|s| Crash::new(s, &l.exit_codes, &server.log));
-        let tail = ended.as_ref().ok().and_then(|c| c.stderr_tail.last().map(|t| format!("; log: {t}"))).unwrap_or_default();
-        bail!("{} before initialize answered ({e}){tail}", ended.map_or("killed".into(), |c| c.text));
-    }
-    Ok(server)
+    let reader = |epoch, file| {
+        *lock(&slot.docs) = Docs { epoch, ..Docs::default() };
+        Arc::new(Reader { live: slot.live.clone(), woke: slot.woke.clone(), epoch, settings: l.settings.clone(), folders: folders.clone(), log: Some(Mutex::new(file)) })
+            as Arc<dyn Handler>
+    };
+    host.start_server(slot, "lsp", l, env, Framing::Headers, Dialect::Lsp, reader, |s| initialize(&s.peer, slot, l, &host.ws.root, folders.clone()))
 }
 
 /// `initialize` (processId, the root as rootUri and the one workspace folder, clientInfo, the
@@ -732,7 +693,7 @@ fn start(host: &Host, slot: &Slot, l: &Launch, env: &BTreeMap<String, String>) -
 fn initialize(peer: &Peer, slot: &Slot, l: &Launch, root: &Path, folders: Value) -> Result<()> {
     let params = json!({"processId": process::id(), "rootUri": uri(root), "workspaceFolders": folders, "clientInfo": {"name": "itse", "version": env!("CARGO_PKG_VERSION")},
         "capabilities": capabilities(), "initializationOptions": l.init_options});
-    let reply = peer.request("initialize", params, INIT, &Cancel::default()).map_err(|e| anyhow!("initialize: {e}"))?;
+    let reply = peer.request("initialize", params, INIT, &Cancel::default()).map_err(|e| anyhow!("before initialize answered (initialize: {e})"))?;
     {
         let (s, caps) = (&mut lock(&slot.live).lsp, &reply["capabilities"]);
         (s.utf16, s.at, s.save_text) = (caps["positionEncoding"].as_str() != Some("utf-8"), Some(Instant::now()), caps["textDocumentSync"]["save"]["includeText"] == true);
@@ -798,8 +759,7 @@ pub fn servers(host: &Arc<Host>, caller: &BTreeMap<String, String>, verb: &str, 
             _ => Ok(Asks { states, unready, ..Asks::default() }),
         };
     }
-    let base: BTreeMap<String, String> = host.base_env.iter().map(|(k, v)| (k.to_string_lossy().into_owned(), v.to_string_lossy().into_owned())).collect();
-    let env = env::workspace_env(&r, &host.dirs, base.clone(), &store::Real(base)).map_err(|e| fail("io", format!("{e:#}")))?;
+    let env = host.server_env(&r).map_err(|e| fail("io", format!("{e:#}")))?;
     let mut found = Asks { untrusted, states, unready, ..Asks::default() };
     for l in launches {
         match ask(host, l, &env, start, cancel).map_err(|e| fail("server_start", format!("lsp:{}: {e:#}", l.id)))? {
@@ -813,25 +773,14 @@ pub fn servers(host: &Arc<Host>, caller: &BTreeMap<String, String>, verb: &str, 
     Ok(found)
 }
 
-/// The `status` row of `lsp:<id>`, read without waiting on a start: `starting (41 s)`, `up` with
-/// its index flag, `crashed` with how, `gone` after a daemon restart, or `stopped`.
+/// The `status` row of `lsp:<id>`, with its index flag and diagnostics while it is up.
 pub fn row(host: &Host, l: &Launch) -> State {
-    let handle = format!("lsp:{}", l.id);
-    let slot = lock(&host.slots).get(&handle).cloned().unwrap_or_default();
-    let (state, reason) = match slot.phase.try_lock().as_deref() {
-        Ok(Phase::Starting(at)) => (format!("starting ({} s)", at.elapsed().as_secs()), String::new()),
-        Ok(Phase::Up(s)) => {
-            let live = lock(&slot.live);
-            let pid = s.child.try_lock().map(|c| format!("pid {}", c.id()));
-            let parts: Vec<String> = pid.into_iter().chain(live.lsp.summary()).chain(changed(s, l)).chain(live.last.back().cloned()).collect();
-            ("up".into(), parts.join("; "))
-        }
-        Ok(Phase::Crashed(c)) => ("crashed".into(), format!("{}{}; the next use starts it again", c.text, c.stderr_tail.last().map_or(String::new(), |t| format!("; log: {t}")))),
-        Ok(Phase::Gone(why)) => ("gone".into(), format!("{why}; the next use starts it cold")),
-        Ok(Phase::Stopped) => ("stopped".into(), "starts on first use".into()),
-        Err(_) => ("busy".into(), String::new()),
-    };
-    State { item: handle, state, reason: Some(reason).filter(|r| !r.is_empty()), ..State::default() }
+    host.row("lsp", l, |live| live.lsp.summary())
+}
+
+/// For the usage log: every server asked was warm (`rust-analyzer index warm`); None if none was asked.
+pub fn warm(index: &[String]) -> Option<bool> {
+    (!index.is_empty()).then(|| index.iter().all(|i| i.contains(" index warm")))
 }
 
 /// The usage log's class of a failed query.
@@ -988,7 +937,7 @@ impl Found {
         let mut notes: Vec<String> = self.asks.iter_mut().flat_map(|a| std::mem::take(&mut a.notes)).collect();
         notes.extend((n == 0 && self.index.iter().any(|i| i.contains(" index cold"))).then(|| "index cold: an empty answer may change; retry".to_string()));
         let verdict = if n == 0 { Verdict::Empty } else { Verdict::Ok };
-        Outcome { items, notes, ..Outcome::new(verb, verdict, scope, counts.into_iter().flatten().collect::<Vec<_>>().join("; ")) }
+        Outcome { items, notes, warm: warm(&self.index), ..Outcome::new(verb, verdict, scope, counts.into_iter().flatten().collect::<Vec<_>>().join("; ")) }
     }
 }
 
@@ -1065,7 +1014,7 @@ pub fn refs(host: &Arc<Host>, caller: &BTreeMap<String, String>, session: &str, 
     let counts = format!("{} in {}; {}", parse::plural(refs.len(), "reference"), parse::plural(files, "file"), ask.indexed());
     let verdict = if refs.is_empty() { Verdict::Empty } else { Verdict::Ok };
     let notes = std::mem::take(&mut ask.notes).into_iter().chain(["precise references only; strings and comments not searched".into()]).collect();
-    Ok(Outcome { items: [item].into_iter().chain(refs).collect(), notes, ..Outcome::new("refs", verdict, name, counts) })
+    Ok(Outcome { items: [item].into_iter().chain(refs).collect(), notes, warm: warm(&[ask.indexed()]), ..Outcome::new("refs", verdict, name, counts) })
 }
 
 /// `info <name|S-id>`: the symbol at its definition, with the hover's signature and docs as its
@@ -1089,7 +1038,7 @@ pub fn info(host: &Arc<Host>, caller: &BTreeMap<String, String>, session: &str, 
     let lines = parts.iter().flat_map(|p| p.lines()).map(str::trim_end).filter(|l| !l.is_empty() && !l.starts_with("```") && *l != "---");
     item.detail = lines.take(40).map(|l| clip(l, MAX_TEXT)).collect();
     let counts = format!("1 match; {}", ask.indexed());
-    Ok(Outcome { items: vec![item], notes: std::mem::take(&mut ask.notes), ..Outcome::new("info", Verdict::Ok, name, counts) })
+    Ok(Outcome { items: vec![item], notes: std::mem::take(&mut ask.notes), warm: warm(&[ask.indexed()]), ..Outcome::new("info", Verdict::Ok, name, counts) })
 }
 
 /// `outline <path>`: the file's symbols from `textDocument/documentSymbol`, from the server whose
@@ -1111,7 +1060,7 @@ pub fn outline(host: &Arc<Host>, caller: &BTreeMap<String, String>, cwd: &Path, 
         todo.extend(s["children"].as_array().into_iter().flatten().rev().filter(|_| depth == 0).map(|c| (1, c)));
     }
     let counts = format!("{}; {}", parse::plural(items.len(), "symbol"), ask.indexed());
-    Ok(Outcome { items, notes: std::mem::take(&mut ask.notes), ..Outcome::new("outline", Verdict::Ok, path, counts) })
+    Ok(Outcome { items, notes: std::mem::take(&mut ask.notes), warm: warm(&[ask.indexed()]), ..Outcome::new("outline", Verdict::Ok, path, counts) })
 }
 
 /// What the LSP servers in use pushed, for `problems`.

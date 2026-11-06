@@ -5,18 +5,18 @@
 use super::resolver::{git, repo, tree};
 use super::*;
 
-const LIB: &str = "// orders\npub fn save() {}\n";
+pub(super) const LIB: &str = "// orders\npub fn save() {}\n";
 
-fn symbols() -> Value {
+pub(super) fn symbols() -> Value {
     json!([{"name": "save", "kind": 12, "container": "orders", "path": "src/lib.rs", "line": 1, "character": 7},
            {"name": "saveAll", "kind": 12, "container": "orders", "path": "src/lib.rs", "line": 1, "character": 7}])
 }
 
 /// A committed workspace that uses the extension `fix`, whose one server is the fixture LSP with
 /// this script and mode, its messages logged; `code` marks it as running project code.
-struct Fix {
-    env: Env,
-    log: PathBuf,
+pub(super) struct Fix {
+    pub(super) env: Env,
+    pub(super) log: PathBuf,
     /// Env for every call, so the daemon the first call starts has it.
     vars: Vec<(&'static str, &'static str)>,
 }
@@ -25,7 +25,7 @@ struct Fix {
 const IDLE: &[(&str, &str)] = &[("ITSE_SERVER_IDLE_S", "60")];
 
 impl Fix {
-    fn new(script: Value, mode: &str, code: bool) -> Option<Self> {
+    pub(super) fn new(script: Value, mode: &str, code: bool) -> Option<Self> {
         Self::with(script, mode, code, IDLE)
     }
 
@@ -49,11 +49,11 @@ impl Fix {
     }
 
     /// `itse ARGS` in the work folder: (exit code, stdout and stderr).
-    fn itse(&self, args: &[&str]) -> (Option<i32>, String) {
+    pub(super) fn itse(&self, args: &[&str]) -> (Option<i32>, String) {
         self.itse_env(args, &[])
     }
 
-    fn itse_env(&self, args: &[&str], extra: &[(&str, &str)]) -> (Option<i32>, String) {
+    pub(super) fn itse_env(&self, args: &[&str], extra: &[(&str, &str)]) -> (Option<i32>, String) {
         let out = self.env.command(&self.env.work(), args).envs(self.vars.iter().chain(extra).copied()).output().unwrap();
         (out.status.code(), stdout(&out) + &String::from_utf8_lossy(&out.stderr))
     }
@@ -109,6 +109,11 @@ fn the_first_query_on_a_cold_index_says_so() {
     let row = fix.row();
     assert!(row.starts_with("up             lsp:fixture          pid ") && row.contains("; index warm; 0 diagnostics; "), "{row}");
     assert!(row.ends_with(" window/logMessage: fixture indexing"), "the last message: {row}");
+    // The usage log says which answers were warm, and so does stats.
+    let warm: Vec<Value> = fix.env.usage().iter().filter(|r| r["verb"] == "find").map(|r| r["warm"].clone()).collect();
+    assert_eq!(warm, [false, true, true, true]);
+    let stats = stdout(&fix.env.itse(&fix.env.work(), &["stats", "--by", "verb"]));
+    assert!(stats.lines().any(|l| l.starts_with("find ") && l.ends_with(" 75%")), "{stats}");
 }
 
 #[test]

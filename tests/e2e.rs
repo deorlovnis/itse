@@ -68,6 +68,10 @@ impl Env {
             .env("ITSE_SERVER_IDLE_S", "2")
             .env_remove("XDG_RUNTIME_DIR")
             .env_remove("ITSE_WORKSPACE")
+            .env_remove("CLAUDE_CONFIG_DIR")
+            // A harness the tests run in names no session or client of theirs.
+            .env_remove("CLAUDE_CODE_SESSION_ID")
+            .env_remove("AI_AGENT")
             .env_remove("ITSE_TEST_PROTO")
             .env_remove("ITSE_TEST_SLOW_MS")
             .env_remove("ITSE_TEST_SETTLE_MS")
@@ -802,7 +806,7 @@ fn check_record(r: &Value) {
         "tools",
         "list_bytes",
     ];
-    let verbs = ["status", "show", "find", "test", "verbs", "unknown", "stats", "integrate", "ext", "trust", "mcp", "daemon"];
+    let verbs = ["status", "show", "find", "test", "problems", "verbs", "unknown", "stats", "integrate", "ext", "trust", "mcp", "daemon", "use", "stop", "ext_tool"];
     let errs = [
         "bad_args",
         "unknown_verb",
@@ -881,16 +885,26 @@ fn usage_lines_hold_no_values() {
         let mut line = String::new();
         reader.read_line(&mut line).unwrap();
     }
+    // `itse hook` itself, after a `use` that declares servers, with a secret file, body and session.
+    assert!(cli(&["use", "rust"]).status.success());
+    let secret = env.work().join("zqx_secret.rs");
+    fs::write(&secret, body).unwrap();
+    let payload = json!({"session_id": "zqx-hook-session", "cwd": env.work(), "tool_input": {"file_path": secret, "content": body}});
+    let mut hook = env.command(&env.work(), &["hook", "post-edit"]).envs(secrets).stdin(Stdio::piped()).stdout(Stdio::piped()).spawn().unwrap();
+    hook.stdin.take().unwrap().write_all(payload.to_string().as_bytes()).unwrap();
+    assert!(hook.wait_with_output().unwrap().status.success());
     let log = fs::read_to_string(env.dir.join("state/itse/usage.jsonl")).unwrap();
     for needle in ["zqx", "sk-ant", "/work/secret", "Thing.kt", "OrderRepository", "saves_order", "fn main", "\\u001b", "\u{1b}", "\\u0007", "invalid option", "not built"] {
         assert!(!log.contains(needle), "{needle:?} in the usage log:\n{log}");
     }
     let records = env.usage();
-    // The CLI refuses `status sk-ant-…` itself; the other 6 CLI calls, 5 + 2 MCP records and the hook's call reach the log.
-    assert_eq!(records.len(), 14, "{records:?}");
+    // The CLI refuses `status sk-ant-…` itself; the other 7 CLI calls, 5 + 2 MCP records and the 2 hook calls reach the log.
+    assert_eq!(records.len(), 16, "{records:?}");
     records.iter().for_each(check_record);
     let vias: std::collections::BTreeSet<&str> = records.iter().filter_map(|r| r["via"].as_str()).collect();
     assert_eq!(vias.into_iter().collect::<Vec<_>>(), ["cli", "hook", "mcp"]);
+    let hooked = records.iter().find(|r| r["via"] == "hook" && r["verb"] == "problems").expect("the hook's call");
+    assert_eq!((&hooked["settled"], &hooked["err"]), (&json!(false), &json!("untrusted")), "{hooked}");
     assert!(records.iter().any(|r| r["verb"] == "unknown" && r["err"] == "unknown_verb"));
     assert!(records.iter().any(|r| r["client"] == "evil?[31mtool" && r["client_v"] == "9?"), "ITSE_CLIENT, clipped");
     assert_eq!(records.iter().filter(|r| r["client"] == "agent?]0;evil?").count(), 2, "clientInfo, clipped, on the init and the call");
@@ -927,6 +941,22 @@ fn config_off_writes_nothing() {
     assert!(!env.dir.join("state/itse/usage.jsonl").exists());
     let status = stdout(&env.itse(&env.work(), &["status"]));
     assert!(status.contains("\nusage log: off; ITSE_USAGE=off or \"usage\": false in "), "{status}");
+}
+
+#[test]
+fn a_usage_record_cut_short_by_a_full_disk_leaves_no_fragment() {
+    let env = Env::new();
+    assert!(env.itse(&env.work(), &["verbs"]).status.success());
+    let log = env.dir.join("state/itse/usage.jsonl");
+    let first = fs::read_to_string(&log).unwrap();
+    let pad = format!("{}\n", json!({"pad": "x".repeat(900 - first.len())}));
+    fs::write(&log, format!("{first}{pad}")).unwrap();
+    // 1,024 bytes at most (2 blocks of 512) and SIGXFSZ ignored: the next record's write stops part-way.
+    let script = format!("trap '' XFSZ; ulimit -f 2; exec '{ITSE}' verbs");
+    assert!(env.command_of("/bin/sh", &env.work(), &["-c", &script]).output().unwrap().status.success(), "the call still answers");
+    assert_eq!(fs::read_to_string(&log).unwrap(), format!("{first}{pad}"), "the cut record is gone");
+    assert!(env.itse(&env.work(), &["verbs"]).status.success());
+    assert_eq!(env.usage().len(), 3, "every line a whole record");
 }
 
 #[test]
@@ -1026,6 +1056,16 @@ mod cargo;
 mod lsp;
 #[path = "e2e/ra.rs"]
 mod ra;
+
+// --- hosted MCP servers ---
+
+#[path = "e2e/mcp.rs"]
+mod mcp;
+
+// --- harness integration and the hook ---
+
+#[path = "e2e/harness.rs"]
+mod harness;
 
 // --- debug adapters ---
 

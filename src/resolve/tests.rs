@@ -379,5 +379,5 @@ fn team_server_settings_wait_for_trust_and_init_options_are_rendered() {
     assert_eq!(l.init_options, json!({"root": root, "n": [1, cache]}));
     fx.trust();
     let l = &fx.resolve().launches[0];
-    assert_eq!((l.expose, &l.settings), (true, &json!({"x": 1})));
+    assert_eq!((l.expose, &l.settings), (false, &json!({"x": 1})), "a trusted team layer sets settings, but exposing tools is the developer's choice");
 }

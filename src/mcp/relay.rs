@@ -120,7 +120,7 @@ fn fail(why: &str) -> u8 {
 
 /// Connect in `mcp` mode, starting a daemon if none answers, and pass its lines to the main loop.
 fn attach(ws: &Workspace, dirs: &Dirs, generation: u64, tx: &Sender<Msg>) -> Result<UnixStream> {
-    let (reader, _) = client::connect(ws, dirs, "mcp")?;
+    let (reader, _) = client::connect(ws, dirs, "mcp", &[])?;
     let (tx, stream) = (tx.clone(), reader.get_ref().try_clone()?);
     thread::spawn(move || {
         reader.lines().map_while(Result::ok).try_for_each(|line| tx.send(Msg::Daemon(generation, Some(line)))).ok();

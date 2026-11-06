@@ -16,10 +16,11 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Result, anyhow, bail};
+use regex_lite::Regex;
 use serde::Serialize;
 use serde_json::{Value, json};
 
-use crate::manifest::Config;
+use crate::manifest::{Config, Exts};
 use crate::sys::{self, lock};
 use crate::verbs::Args;
 use crate::workspace::Dirs;
@@ -66,7 +67,7 @@ pub struct Call {
     /// Clipped to 64 chars, control characters as `?`.
     pub client: String,
     pub client_v: Option<String>,
-    /// From the closed verb table, `<server>__<tool>`, or `unknown`.
+    /// From the closed verb table, `ext_tool` for an exposed server's tool, or `unknown`.
     pub verb: String,
     pub ext: Option<String>,
     pub ms: u64,
@@ -130,6 +131,28 @@ impl Usage {
         Ident { session, sess: key.unwrap_or(random), client: clip(client), client_v }
     }
 
+    /// `env` with ITSE_SESSION and ITSE_CLIENT, where the caller set neither, from a harness
+    /// extension's `identity`: its session env var, and its client env var through `client_regexp`,
+    /// group 1 the name and the others the version's parts. So a harness's MCP, hook and shell
+    /// calls are one session of one client.
+    pub fn identified(exts: &Exts, env: &BTreeMap<String, String>) -> BTreeMap<String, String> {
+        let mut env = env.clone();
+        for i in exts.values().filter_map(|(e, _)| e.identity.as_ref()) {
+            let var = |k: &Option<String>| k.as_ref().and_then(|k| env.get(k)).filter(|v| !v.is_empty()).cloned();
+            let client = var(&i.client_env).and_then(|v| {
+                let c = Regex::new(i.client_regexp.as_deref()?).ok()?.captures(&v)?;
+                let parts: Vec<&str> = c.iter().skip(2).flatten().map(|m| m.as_str()).collect();
+                Some(format!("{}/{}", c.get(1)?.as_str(), parts.join(".")))
+            });
+            for (key, value) in [("ITSE_SESSION", var(&i.session_env)), ("ITSE_CLIENT", client)] {
+                if let Some(v) = value {
+                    env.entry(key.into()).or_insert(v);
+                }
+            }
+        }
+        env
+    }
+
     /// Off by ITSE_USAGE=off here or in the caller's env, or by `"usage": false` in config.json.
     pub fn on(&self, env: &BTreeMap<String, String>) -> bool {
         let mtime = fs::metadata(&self.config).and_then(|m| m.modified()).ok();
@@ -155,8 +178,8 @@ impl Usage {
         }
     }
 
-    /// Append one line under the file's lock. A writer that finds the log past `ROTATE_AT` renames
-    /// it first; one whose open file was renamed meanwhile opens the path again.
+    /// Append one line under the file's lock, whole or not at all. A writer that finds the log past
+    /// `ROTATE_AT` renames it first; one whose open file was renamed meanwhile opens the path again.
     fn append(&self, line: &str) -> Result<()> {
         let path = self.path();
         sys::private_dir(&self.state)?;
@@ -176,7 +199,13 @@ impl Usage {
             } else {
                 file
             };
-            return Ok((&target).write_all(line.as_bytes())?);
+            // A write cut short (a full disk) is cut off again, so every line is a whole record.
+            let len = target.metadata()?.len();
+            let written = (&target).write_all(line.as_bytes());
+            if written.is_err() {
+                let _ = target.set_len(len);
+            }
+            return Ok(written?);
         }
         bail!("{} kept changing while locked", path.display())
     }

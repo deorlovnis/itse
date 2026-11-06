@@ -6,6 +6,8 @@ command = ["sh", "{adapter_dir}/fake.sh", "{arm}", "{task_dir}", "{mcp_config}",
 parser = "json-last"
 pass_env = ["FAKE_PASSED"]
 require_env = ["FAKE_PASSED"]
+# It stands in for Claude Code, so itse sets it up as Claude Code.
+integrate = "claude-code"
 
 [fake.env]
 CLAUDE_CONFIG_DIR = "{cfg}/.claude"

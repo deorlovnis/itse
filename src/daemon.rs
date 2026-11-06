@@ -234,7 +234,8 @@ fn hello(host: &Host, params: Value, conn: &Mutex<UnixStream>) -> Result<(Caller
     }
     match serde_json::from_value::<Caller>(params) {
         Ok(mut caller) if matches!(caller.mode.as_str(), "cli" | "hook" | "mcp") => {
-            caller.id = host.usage.ident(&caller.mode, &caller.env);
+            let exts = crate::manifest::extensions(&host.dirs).map(|e| e.0).unwrap_or_default();
+            caller.id = host.usage.ident(&caller.mode, &crate::usage::Usage::identified(&exts, &caller.env));
             let reply = json!({"proto": proto(), "version": VERSION, "pid": process::id(), "root": host.ws.root, "ws": host.ws.ws, "started": sys::utc(host.started),
                 "exe": [host.exe.0, host.exe.1], "busy": host.busy()});
             let _ = lock(conn).set_read_timeout(None);

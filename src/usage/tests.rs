@@ -85,6 +85,18 @@ fn sessions_are_hashed_and_clients_clipped() {
 }
 
 #[test]
+fn a_harness_identity_names_the_session_and_client() {
+    let tmp = TempDir::new("itse-usage");
+    let (usage, exts) = (Usage::new(&dirs(&tmp), &tmp.0, false), crate::manifest::extensions(&dirs(&tmp)).unwrap().0);
+    let env = |pairs: &[(&str, &str)]| -> BTreeMap<String, String> { pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect() };
+    let harness = env(&[("CLAUDE_CODE_SESSION_ID", "s-1"), ("AI_AGENT", "claude-code_2-1-312_agent")]);
+    let (mcp, hook) = (usage.ident("mcp", &Usage::identified(&exts, &harness)), usage.ident("hook", &env(&[("ITSE_SESSION", "s-1")])));
+    assert_eq!((&mcp.sess, mcp.client.as_str(), mcp.client_v.as_deref()), (&hook.sess, "claude-code", Some("2.1.312")), "its MCP and hook calls are one session");
+    let set = Usage::identified(&exts, &env(&[("CLAUDE_CODE_SESSION_ID", "s-1"), ("ITSE_SESSION", "s-2"), ("AI_AGENT", "other")]));
+    assert_eq!((set["ITSE_SESSION"].as_str(), set.get("ITSE_CLIENT")), ("s-2", None), "what the caller set wins; an unmatched client is none");
+}
+
+#[test]
 fn config_off_writes_nothing() {
     let tmp = TempDir::new("itse-usage");
     let d = dirs(&tmp);

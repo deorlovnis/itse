@@ -231,6 +231,8 @@ fn launches(cx: &Cx, m: &Manifest, uses: &[Use], roots: &BTreeMap<String, PathBu
             let (Ok(argv), Ok(env), Ok(via)) = (argv, env, via) else { continue };
             // Before trust the team layer is read for status only, so its server settings wait too.
             let set = settings.get(&s.id).filter(|x| trusted || !x.1).map(|x| x.0);
+            // Exposing a server's tools is the developer's choice alone, never the team layer's.
+            let exposed = settings.get(&s.id).filter(|x| !x.1 && x.0.expose).map(|x| x.0);
             let lsp_settings = set.and_then(|x| x.settings.as_ref()).unwrap_or(&s.settings);
             let (Ok(settings), Ok(init_options)) = (render_value(lsp_settings, &mut fill), render_value(&s.init_options, &mut fill)) else { continue };
             // Without init_options a server gets its own section of the settings, so a manifest says them once.
@@ -251,7 +253,9 @@ fn launches(cx: &Cx, m: &Manifest, uses: &[Use], roots: &BTreeMap<String, PathBu
                 outputs: s.outputs.clone(),
                 idle_minutes: set.and_then(|x| x.idle_minutes).or(s.idle_minutes),
                 timeout_s: s.timeout_s,
-                expose: set.is_some_and(|x| x.expose),
+                expose: exposed.is_some(),
+                tools: exposed.and_then(|x| x.tools.clone()),
+                max_list_bytes: exposed.and_then(|x| x.max_list_bytes),
                 via,
             });
         }

@@ -7,7 +7,10 @@
 //! `use`, `unuse`, `ext`, `trust` and `consent`, the store's: `install`, `lock` and `gc`, and status
 //! rows; `run`, `build`, `test`, `cancel` and `stop` (in `actions`), `problems` over action
 //! results (in `parse`) and the language servers' diagnostics, `find`, `refs`, `info` and
-//! `outline` on the language servers (in `lsp`), and `debug` on debug adapters (in `dap`).
+//! `outline` on the language servers (in `lsp`), `debug` on debug adapters (in `dap`), `ext tools`
+//! on hosted MCP servers (in `mcp::client`), and `integrate` and `hook` for harnesses (in `harness`).
+
+pub mod harness;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
@@ -226,7 +229,8 @@ pub fn call(host: &Arc<Host>, caller: &Caller, params: &Value, cancel: &Cancel) 
                 let wait = Duration::from_millis(ms.unwrap_or(if via == "hook" { 1500 } else { 20_000 }));
                 let mut lsp = crate::lsp::problems(host, &caller.env, scope, via != "hook", wait, cancel);
                 lsp.settled &= !cancel.is_cancelled();
-                let o = parse::problems(&store, scope, all, new, &format!("{via}:{session}"), &mut lsp).map(|o| Outcome {
+                let mut o = parse::problems(&store, scope, all, new, &format!("{via}:{session}"), &mut lsp).map(|o| Outcome {
+                    warm: crate::lsp::warm(&lsp.index),
                     counts: lsp.untrusted.iter().cloned().chain([o.counts.clone()]).chain(lsp.index).collect::<Vec<_>>().join("; "),
                     // Before trust a server in scope never ran, so its problems are unknown, not none.
                     verdict: if lsp.untrusted.is_some() { Verdict::Untrusted } else { o.verdict },
@@ -235,6 +239,13 @@ pub fn call(host: &Arc<Host>, caller: &Caller, params: &Value, cancel: &Cancel) 
                     notes: o.notes.iter().cloned().chain(lsp.notes).collect(),
                     ..o
                 });
+                // A hook passes on errors and warnings only; with neither, it has nothing to say.
+                if let Ok(o) = o.as_mut()
+                    && via == "hook"
+                {
+                    o.items.retain(|i| i.kind == "error" || i.kind == "warning");
+                    o.verdict = if o.items.is_empty() && o.verdict != Verdict::Untrusted { Verdict::Empty } else { o.verdict };
+                }
                 sh(o.unwrap_or_else(|e| Outcome::error("problems", "io", format!("{e:#}"))), page)
             }
             "cancel" | "stop" => sh(stop(host, v.name, args.target.as_deref().unwrap_or_default()), page),
@@ -243,10 +254,12 @@ pub fn call(host: &Arc<Host>, caller: &Caller, params: &Value, cancel: &Cancel) 
             "refs" => sh(crate::lsp::refs(host, &caller.env, session, args.target.as_deref().unwrap_or_default(), cancel).unwrap_or_else(|o| *o), page),
             "info" => sh(crate::lsp::info(host, &caller.env, session, args.target.as_deref().unwrap_or_default(), cancel).unwrap_or_else(|o| *o), page),
             "outline" => sh(crate::lsp::outline(host, &caller.env, &caller.cwd, args.target.as_deref().unwrap_or_default(), cancel).unwrap_or_else(|o| *o), page),
+            "ext" if args.target.as_deref() == Some("tools") => sh(crate::mcp::client::ext_tools(host, caller, args.rest.first().map_or("", String::as_str), cancel), page),
             "use" | "unuse" | "ext" | "trust" | "consent" => {
                 let o = manifest_verb(&host.ws, &host.dirs, &caller.env, &caller.cwd, v.name, &args, params["tty"] == true);
                 // A revoked trust or an unused extension leaves a server that may no longer run: it stops now.
                 let _ = crate::lsp::servers(host, &caller.env, v.name, "", &|_| false, false, cancel);
+                let _ = crate::mcp::client::resolved(host, &caller.env);
                 crate::dap::untrusted(host, &caller.env);
                 sh(o, page)
             }
@@ -254,22 +267,25 @@ pub fn call(host: &Arc<Host>, caller: &Caller, params: &Value, cancel: &Cancel) 
         },
     };
     let ms = started.elapsed().as_millis() as u64;
-    record(&host.usage, caller, verb.map_or("unknown", |v| v.name), ms, &answer);
-    json!({"exit": exit(&answer), "text": answer.text})
+    record(&host.usage, caller, verb.map_or("unknown", |v| v.name), None, ms, &answer);
+    json!({"exit": exit(&answer), "text": answer.text, "verdict": answer.verdict, "settled": answer.settled})
 }
 
 /// What a caller gets back: the text, and what the usage log counts about it.
+#[derive(Default)]
 pub struct Answer {
     pub verdict: Verdict,
     pub text: String,
     pub full: u64,
     pub trunc: bool,
     pub err: Option<&'static str>,
+    pub warm: Option<bool>,
+    pub settled: Option<bool>,
 }
 
 impl Answer {
     pub fn failed(o: Outcome) -> Self {
-        Self { verdict: Verdict::Error, text: o.head() + "\n", full: 0, trunc: false, err: o.err }
+        Self { verdict: Verdict::Error, text: o.head() + "\n", err: o.err, ..Self::default() }
     }
 }
 
@@ -289,7 +305,8 @@ fn shape(mut o: Outcome, store: &Store, via: &str, session: &str, n: u32) -> Ans
     if o.id.as_deref().is_some_and(|id| id.starts_with("q:")) {
         let _ = store.save(&o, session).inspect_err(|e| eprintln!("itse daemon: results: {e:#}"));
     }
-    Answer { verdict: o.verdict, full: o.full.bytes, trunc: o.page.of > 1 || o.items.iter().any(|i| i.detail.len() > DETAIL), err: o.err, text }
+    let trunc = o.page.of > 1 || o.items.iter().any(|i| i.detail.len() > DETAIL);
+    Answer { verdict: o.verdict, full: o.full.bytes, trunc, err: o.err, text, warm: o.warm, settled: o.settled }
 }
 
 /// A verb's tokens: from MCP's `args` or the CLI's (both strings for the same parser), or parsed `Args`.
@@ -318,8 +335,9 @@ fn exit(a: &Answer) -> u8 {
     }
 }
 
-/// One `call` line in the usage log: the verb's name from the table, never the caller's string.
-fn record(usage: &Usage, caller: &Caller, verb: &str, ms: u64, a: &Answer) {
+/// One `call` line in the usage log: the verb's name from the table (or a closed class), never the
+/// caller's string; `ext` is a built-in extension's id.
+pub fn record(usage: &Usage, caller: &Caller, verb: &str, ext: Option<String>, ms: u64, a: &Answer) {
     let outcome = match (a.verdict, a.err) {
         (_, Some("cancel")) => "cancel",
         (_, Some("timeout")) => "timeout",
@@ -330,7 +348,7 @@ fn record(usage: &Usage, caller: &Caller, verb: &str, ms: u64, a: &Answer) {
     let via = ["mcp", "hook"].into_iter().find(|m| *m == caller.mode).unwrap_or("cli");
     let (err, bytes) = (a.err.filter(|e| !matches!(*e, "cancel" | "timeout")), a.text.len() as u64);
     let (client, client_v) = (caller.id.client.clone(), caller.id.client_v.clone());
-    let call = Call { via, client, client_v, verb: verb.into(), ms, outcome, err, bytes, full: a.full.max(bytes), trunc: a.trunc, ..Call::default() };
+    let call = Call { via, client, client_v, verb: verb.into(), ext, ms, outcome, err, bytes, full: a.full.max(bytes), trunc: a.trunc, warm: a.warm, settled: a.settled };
     usage.record(&caller.env, &caller.id.sess, Event::Call(call));
 }
 
@@ -498,9 +516,9 @@ fn install(r: &Resolved, d: &dyn Delegate, dirs: &Dirs, ws: &Workspace, caller: 
     Ok((rows, todo.len().max(names.len())))
 }
 
-/// A `Local` verb run in the CLI process (`verbs`, `use`, `unuse`), recorded through a short-lived
-/// writer; its text and exit code.
-pub fn local(usage: &Usage, ws: &Workspace, dirs: &Dirs, verb: &Verb, args: &Args) -> (String, u8) {
+/// A `Local` verb run in the CLI process (`verbs`, `use`, `unuse`, `integrate`), recorded through a
+/// short-lived writer; its text and exit code. `tty` says whether stdin is a terminal.
+pub fn local(usage: &Usage, ws: &Workspace, dirs: &Dirs, verb: &Verb, args: &Args, tty: bool) -> (String, u8) {
     let (started, env): (_, BTreeMap<String, String>) = (Instant::now(), std::env::vars().collect());
     let caller = Caller { id: usage.ident("cli", &env), mode: "cli".into(), env, ..Caller::default() };
     let answer = if verb.name == "verbs" {
@@ -508,13 +526,17 @@ pub fn local(usage: &Usage, ws: &Workspace, dirs: &Dirs, verb: &Verb, args: &Arg
         let r = resolve(ws, dirs, &caller.env, SystemTime::now());
         let debug = r.is_ok_and(|r| r.manifest.uses().iter().filter_map(|u| r.manifest.exts.get(&u.id)).any(|e| e.0.debug.as_ref().is_some_and(|d| !d.adapter.is_empty())));
         let text = index(args.flags.contains_key("json"), debug);
-        Answer { verdict: Verdict::Ok, full: text.len() as u64, text, trunc: false, err: None }
+        Answer { verdict: Verdict::Ok, full: text.len() as u64, text, ..Answer::default() }
     } else {
-        let mut o = manifest_verb(ws, dirs, &caller.env, &std::env::current_dir().unwrap_or_default(), verb.name, args, false);
+        let cwd = std::env::current_dir().unwrap_or_default();
+        let mut o = match verb.name {
+            "integrate" => harness::integrate(ws, dirs, &caller.env, &cwd, args, tty).unwrap_or_else(|e| Outcome::error("integrate", "bad_args", format!("{e:#}"))),
+            _ => manifest_verb(ws, dirs, &caller.env, &cwd, verb.name, args, tty),
+        };
         let text = o.render("cli", 1, VERB, false).unwrap_or_else(|line| line + "\n");
-        Answer { verdict: o.verdict, full: o.full.bytes, trunc: o.page.of > 1, err: o.err, text }
+        Answer { verdict: o.verdict, full: o.full.bytes, trunc: o.page.of > 1, err: o.err, text, ..Answer::default() }
     };
-    record(usage, &caller, verb.name, started.elapsed().as_millis() as u64, &answer);
+    record(usage, &caller, verb.name, None, started.elapsed().as_millis() as u64, &answer);
     (answer.text.clone(), exit(&answer))
 }
 
@@ -525,23 +547,7 @@ pub fn index(json: bool, debug: bool) -> String {
     let rows: Vec<(&str, String, &str, &str)> = VERBS
         .iter()
         .filter(|v| !v.human_only && !v.name.starts_with("__") && (debug || v.tool != Tool::Debug))
-        .map(|v| {
-            let value = |n: &str| match n {
-                "at" => "path:line",
-                "log" => "path:line=text",
-                "frame" => "F",
-                _ => "V",
-            };
-            let arg = |p: &Param| match p {
-                Req(n) => format!("<{n}>"),
-                Pos(n) => format!("[{n}]"),
-                Rest(n) => format!("[{n}…]"),
-                Flag(n) => format!("[--{n}]"),
-                Opt(n) => format!("[--{n} {}]", value(n)),
-                Many(n) => format!("[--{n} {}…]", value(n)),
-            };
-            (v.name, v.params.iter().map(arg).collect::<Vec<_>>().join(" "), crate::mcp::tool_name(v.tool), v.about)
-        })
+        .map(|v| (v.name, synopsis(v), crate::mcp::tool_name(v.tool), v.about))
         .collect();
     if json {
         let verbs: Vec<Value> = rows.iter().map(|(n, a, t, about)| json!({"name": n, "args": a, "tool": t, "about": about})).collect();
@@ -549,6 +555,25 @@ pub fn index(json: bool, debug: bool) -> String {
     }
     let tail = "exit codes: 0 ok, 1 the verb reports failure, 2 error, 3 needs a human, 4 running, 130 interrupted\nresults: the first line is VERDICT verb scope — counts; ids such as run:14/T1 open with 'itse show'\nactions: none declared\n";
     rows.iter().map(|(n, a, _, about)| format!("itse {n} {a}").trim_end().to_string() + &format!("\n    {about}\n")).collect::<String>() + tail
+}
+
+/// A verb's arguments as the index and the skill show them: `<name> [--kind V]`.
+pub fn synopsis(v: &Verb) -> String {
+    let value = |n: &str| match n {
+        "at" => "path:line",
+        "log" => "path:line=text",
+        "frame" => "F",
+        _ => "V",
+    };
+    let arg = |p: &Param| match p {
+        Req(n) => format!("<{n}>"),
+        Pos(n) => format!("[{n}]"),
+        Rest(n) => format!("[{n}…]"),
+        Flag(n) => format!("[--{n}]"),
+        Opt(n) => format!("[--{n} {}]", value(n)),
+        Many(n) => format!("[--{n} {}…]", value(n)),
+    };
+    v.params.iter().map(arg).collect::<Vec<_>>().join(" ")
 }
 
 /// `status`: a row per item from the resolver, `suggested` ones included, then the
@@ -568,7 +593,8 @@ fn status(host: &Host, caller: &Caller, args: &Args, cancel: &Cancel) -> Outcome
     let common = if ws.git { format!("; git common dir {}", ws.repo.display()) } else { String::new() };
     let git = if ws.git { "" } else { "not a git work tree; " };
     let (debug, bytes) = (host.config().mcp.debug, crate::mcp::list_bytes);
-    let (n, b, cap) = (crate::mcp::tools(debug).len(), bytes(debug), crate::mcp::LIST_CAP);
+    let listing = crate::mcp::client::listing(host, &caller.env, debug);
+    let (n, b, cap) = (listing.tools.len(), listing.bytes, crate::mcp::LIST_CAP);
     let on = if debug { "on".into() } else { format!("off (mcp.debug: true adds ~{} tokens)", (bytes(true) - bytes(false)) * 10 / 36) };
     let tools = format!("mcp tools: {n} (~{} tokens incl. instructions; list {b} of {cap} B); debug tool {on}", b * 10 / 36);
     let log = host.usage.path();
@@ -579,8 +605,9 @@ fn status(host: &Host, caller: &Caller, args: &Args, cancel: &Cancel) -> Outcome
         format!("daemon: pid {pid}, started by {} {up} s ago; {VERSION}; proto {}; env keys {}", host.started_by, proto(), host.env_keys_sha()),
         format!("socket: {}", host.socket.display()),
         tools,
-        format!("usage log: {usage}; ITSE_USAGE=off or \"usage\": false in {} stops it", host.dirs.config.join("config.json").display()),
     ];
+    notes.extend(listing.notes);
+    notes.extend([format!("usage log: {usage}; ITSE_USAGE=off or \"usage\": false in {} stops it", host.dirs.config.join("config.json").display())]);
     notes.extend(r.notes);
     if args.flags.contains_key("hosts") {
         let rows: Vec<String> = r.states.iter().filter(|s| !s.hosts.is_empty()).map(|s| format!("{} from {}", s.item, s.hosts.join(", "))).collect();
@@ -591,7 +618,11 @@ fn status(host: &Host, caller: &Caller, args: &Args, cancel: &Cancel) -> Outcome
     let counts = [(unready > 0).then(|| format!("{unready} of {} not ready", r.states.len() - suggested)), (suggested > 0).then(|| format!("{suggested} suggested"))];
     let counts = counts.into_iter().flatten().chain([format!("daemon pid {pid}")]).collect::<Vec<_>>().join("; ");
     let verdict = if unready > 0 { Verdict::Unready } else { Verdict::Ok };
-    let servers = r.launches.iter().filter(|l| l.protocol == crate::host::Protocol::Lsp).map(|l| crate::lsp::row(host, l));
+    let servers = r.launches.iter().filter_map(|l| match l.protocol {
+        crate::host::Protocol::Lsp => Some(crate::lsp::row(host, l)),
+        crate::host::Protocol::Mcp => Some(host.row("mcp", l, |_| Vec::new())),
+        crate::host::Protocol::Dap => None,
+    });
     let debug = crate::dap::rows(host, &r.launches);
     Outcome { states: r.states.iter().cloned().chain(servers).chain(debug).collect(), notes, ..Outcome::new("status", verdict, root.to_string(), counts) }
 }

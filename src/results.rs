@@ -40,6 +40,33 @@ pub const TEXT: &[(&str, &str)] = &[
         "instructions",
         "itse runs this workspace's declared tests, builds and language servers and returns located, paged results with ids.\ntest_build_run: test, build, run <label>, install, lock, use, stop, cancel. problems_symbols: problems (compiler and LSP diagnostics), find, refs, info, outline (symbols by name), status, ext. show_result: run:14/T1, pages, grep, tail.",
     ),
+    // SKILL.md for a harness: the same in every workspace; `itse verbs` has what differs.
+    (
+        "skill",
+        "---
+name: {name}
+description: {description}
+---
+# itse
+
+itse runs this workspace's declared tests, builds and language servers and answers with located, paged results that have ids. Each verb is a shell command, `itse <verb>`, and a call of the itse MCP tools test_build_run, problems_symbols and show_result, whose `args` take the same tokens.
+
+## Verbs
+
+{verbs}
+## Results
+
+- The first line is the verdict: `VERDICT verb scope — counts; cost; id`, such as `FAIL test :data — 2 failed, 141 passed; 38.2 s; run:14`.
+- Items have ids: E1 (errors), W1 (warnings), T1 (tests), S1 (symbols), R1 (references). `itse show run:14/T1` shows one item in full, `itse show q:7 --page 2` the next page, and `--grep RE` or `--tail N` a part of a log.
+- A run that outlasts the wait answers RUNNING with its run:N; `itse show run:N` follows it.
+- NEEDS_HUMAN and UNTRUSTED name the command a human runs in a terminal.
+- Exit codes: 0 ok or an empty listing, 1 the verb reports failure (a name lookup that found nothing too), 2 error, 3 a human acts next, 4 running, 130 interrupted.
+
+## Workspace specifics
+
+`itse verbs` lists this workspace's declared actions, its extensions' notes, and the debug verbs where a debugger is declared.
+",
+    ),
 ];
 
 /// A template from `TEXT` with its fields filled.
@@ -72,6 +99,11 @@ pub struct Outcome {
     /// The usage log's error class; never printed.
     #[serde(skip)]
     pub err: Option<&'static str>,
+    /// For the usage log too: the servers asked were warm, and (`problems`) they settled in time.
+    #[serde(skip)]
+    pub warm: Option<bool>,
+    #[serde(skip)]
+    pub settled: Option<bool>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Serialize)]
@@ -355,7 +387,7 @@ pub fn show(store: &Store, args: &Args, via: &str, session: &str) -> Answer {
     if (item.is_none() || json) && flag("grep").is_none() && tail.is_none() && !raw {
         let full = o.full.bytes;
         let text = o.render(via, page, VERB, json);
-        return text.map_or_else(|line| fail("bad_args", line), |text| Answer { verdict: Verdict::Ok, trunc: o.page.of > 1, full, text, err: None });
+        return text.map_or_else(|line| fail("bad_args", line), |text| Answer { verdict: Verdict::Ok, trunc: o.page.of > 1, full, text, ..Answer::default() });
     }
     let whole = o.whole(via);
     let all: Vec<String> = whole.lines().enumerate().map(|(i, l)| if flag("grep").is_some() { format!("{}: {l}", i + 1) } else { l.to_string() }).collect();
@@ -378,7 +410,7 @@ pub fn show(store: &Store, args: &Args, via: &str, session: &str) -> Answer {
     }
     let head = Outcome { id: Some(id.clone()), ..Outcome::new("show", Verdict::Ok, "", counts) };
     let head = if head.counts.is_empty() { String::new() } else { head.head() + "\n" };
-    Answer { verdict: Verdict::Ok, trunc, full: whole.len() as u64, err: None, text: format!("{head}{}\n", lines.join("\n")) }
+    Answer { verdict: Verdict::Ok, trunc, full: whole.len() as u64, text: format!("{head}{}\n", lines.join("\n")), ..Answer::default() }
 }
 
 #[cfg(test)]

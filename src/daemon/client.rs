@@ -39,19 +39,21 @@ pub fn ask(reader: &mut BufReader<UnixStream>, method: &str, params: Value, wait
     }
 }
 
-/// Connect to the workspace's daemon and say hello in `mode` (`cli` or `mcp`, which also names who
-/// started a daemon). A daemon is started when none answers, and replaced when it speaks another
-/// protocol or, idle, runs a replaced binary. The relay never replaces one for its binary: MCP
-/// lines pass through any daemon of its protocol, and an upgrade would shut down the daemon a newer
-/// CLI just started.
-pub fn connect(ws: &Workspace, dirs: &Dirs, mode: &str) -> Result<Conn> {
-    let (socket, exe) = (ws.socket(dirs, Path::new("/tmp"))?, exe_id());
-    let env: serde_json::Map<String, Value> = env::vars_os().map(|(k, v)| (k.to_string_lossy().into(), v.to_string_lossy().into())).collect();
+/// Connect to the workspace's daemon and say hello in `mode` (`cli`, `mcp` or `hook`; the first two
+/// also name who started a daemon), with this process's env and `extra` over it. A daemon is started
+/// when none answers, and replaced when it speaks another protocol or, idle, runs a replaced binary.
+/// The relay never replaces one for its binary: MCP lines pass through any daemon of its protocol,
+/// and an upgrade would shut down the daemon a newer CLI just started. A hook never starts or
+/// replaces one: without a daemon of its protocol it fails.
+pub fn connect(ws: &Workspace, dirs: &Dirs, mode: &str, extra: &[(&str, &str)]) -> Result<Conn> {
+    let (socket, exe, hook) = (ws.socket(dirs, Path::new("/tmp"))?, exe_id(), mode == "hook");
+    let mut env: serde_json::Map<String, Value> = env::vars_os().map(|(k, v)| (k.to_string_lossy().into(), v.to_string_lossy().into())).collect();
+    env.extend(extra.iter().map(|(k, v)| (k.to_string(), json!(v))));
     let (exe_path, cwd) = (env::current_exe().unwrap_or_default(), env::current_dir().unwrap_or_default());
     let hello = json!({"proto": proto(), "version": VERSION, "exe": [exe.0, exe.1], "exe_path": exe_path, "mode": mode, "cwd": cwd, "env": env});
     for last in [false, false, true] {
         let stream = match UnixStream::connect(&socket) {
-            Err(e) if matches!(e.kind(), ErrorKind::NotFound | ErrorKind::ConnectionRefused) => start(ws, dirs, mode, &socket)?,
+            Err(e) if matches!(e.kind(), ErrorKind::NotFound | ErrorKind::ConnectionRefused) && !hook => start(ws, dirs, mode, &socket)?,
             stream => stream.with_context(|| format!("connecting to {}", socket.display()))?,
         };
         // The hello carries the env: only to a daemon of ours.
@@ -60,7 +62,7 @@ pub fn connect(ws: &Workspace, dirs: &Dirs, mode: &str) -> Result<Conn> {
         let mut reader = BufReader::new(stream);
         let reason = match ask(&mut reader, "hello", hello.clone(), Some(HELLO_WAIT)) {
             Err(RpcError::Remote { code: -32003, .. }) => "proto",
-            Ok(reply) if mode != "mcp" && reply["exe"] != json!([exe.0, exe.1]) && reply["busy"] == false => "upgrade",
+            Ok(reply) if mode == "cli" && reply["exe"] != json!([exe.0, exe.1]) && reply["busy"] == false => "upgrade",
             Ok(hello) => return Ok((reader, hello)),
             Err(RpcError::Timeout) => {
                 bail!("the daemon at {} did not answer hello in 5 s (pid {}); 'itse daemon stop' kills it", socket.display(), running(ws, dirs).map_or(0, |d| d.0))
@@ -69,6 +71,7 @@ pub fn connect(ws: &Workspace, dirs: &Dirs, mode: &str) -> Result<Conn> {
             Err(RpcError::Closed(_)) if !last => continue,
             Err(e) => bail!("hello: {e}"),
         };
+        ensure!(!hook, "the daemon speaks another protocol");
         if !last {
             let _ = ask(&mut reader, "shutdown", json!({"reason": reason}), Some(HELLO_WAIT));
         }

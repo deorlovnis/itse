@@ -5,14 +5,19 @@
 //! Three tools carry every verb an agent runs, with the CLI's own tokens in `args`, parsed by the
 //! same function, so the skill, the index and MCP share one vocabulary; `debug` is listed only on
 //! opt-in (`"mcp": {"debug": true}`). Claude Code defers schemas behind tool search, so the tool
-//! names and `instructions` carry the keywords an agent searches for.
+//! names and `instructions` carry the keywords an agent searches for. The tools of hosted MCP
+//! servers the developer exposes follow them (`client`).
 
+pub mod client;
 pub mod relay;
 
 use std::collections::HashMap;
 use std::io::{BufRead, ErrorKind, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::Duration;
 
 use serde_json::{Value, json};
 
@@ -52,12 +57,17 @@ pub fn next(tokens: &[String], via: &str, human: bool) -> String {
     }
 }
 
-/// The CLI line a shell reads back as these tokens: a plain token bare, any other single-quoted,
-/// since the agent chose them and a human may paste the line.
+/// The CLI line a shell reads back as these tokens.
 fn cli_line(tokens: &[String]) -> String {
+    shell_line(&[&["itse".to_string()], tokens].concat())
+}
+
+/// A command line a shell reads back as this argv: a plain token bare, any other single-quoted,
+/// since an agent may have chosen them and a human may paste the line.
+pub fn shell_line(argv: &[String]) -> String {
     let plain = |t: &String| !t.is_empty() && t.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_./:=@,+%".contains(&b));
     let quote = |t: &String| if plain(t) { t.clone() } else { format!("'{}'", t.replace('\'', r"'\''")) };
-    ["itse".to_string()].into_iter().chain(tokens.iter().map(quote)).collect::<Vec<_>>().join(" ")
+    argv.iter().map(quote).collect::<Vec<_>>().join(" ")
 }
 
 /// The verbs an agent can call through the core tools now: `stats` counts the others as never called.
@@ -102,6 +112,8 @@ pub fn list_bytes(debug: bool) -> usize {
 pub fn serve_io(mut reader: impl BufRead, writer: &Mutex<impl Write + Send>, host: &Arc<Host>, caller: Caller) {
     let (calls, mut caller) = (Mutex::new(HashMap::<String, Cancel>::new()), Arc::new(caller));
     let send = |id, reply| crate::daemon::respond(writer, id, reply);
+    // A list that fills late is told to the harness once per session; a session that ends stops waiting for it.
+    let (told, ended) = (AtomicBool::new(false), AtomicBool::new(false));
     thread::scope(|scope| {
         loop {
             let mut msg = match rpc::read(&mut reader, Framing::Lines, rpc::MAX_FRAME) {
@@ -120,7 +132,18 @@ pub fn serve_io(mut reader: impl BufRead, writer: &Mutex<impl Write + Send>, hos
                     Ok(reply)
                 }
                 "ping" => Ok(json!({})),
-                "tools/list" => Ok(json!({"tools": tools(host.config().mcp.debug)})),
+                "tools/list" => {
+                    // On a thread of its own: a first listing may wait 10 s for a hosted server.
+                    let (caller, send, told, ended) = (caller.clone(), &send, &told, &ended);
+                    scope.spawn(move || {
+                        let (listing, late) = client::tools_list(host, &caller.env, host.config().mcp.debug);
+                        send(id, Ok(json!({"tools": listing.tools})));
+                        if late.is_some_and(|rx| filled(&rx, ended)) && !told.swap(true, Ordering::SeqCst) {
+                            let _ = rpc::write(&mut *lock(writer), Framing::Lines, &json!({"jsonrpc": "2.0", "method": "notifications/tools/list_changed"}));
+                        }
+                    });
+                    continue;
+                }
                 "tools/call" => {
                     let (cancel, key, caller, send, calls) = (Cancel::default(), id.to_string(), caller.clone(), &send, &calls);
                     lock(calls).insert(key.clone(), cancel.clone());
@@ -141,8 +164,20 @@ pub fn serve_io(mut reader: impl BufRead, writer: &Mutex<impl Write + Send>, hos
             };
             send(id, reply);
         }
+        ended.store(true, Ordering::SeqCst);
         lock(&calls).values().for_each(Cancel::cancel);
     });
+}
+
+/// Whether a late list filled, waited for until that is known or the session ends.
+fn filled(rx: &mpsc::Receiver<bool>, ended: &AtomicBool) -> bool {
+    loop {
+        match rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(filled) => return filled,
+            Err(RecvTimeoutError::Timeout) if !ended.load(Ordering::SeqCst) => {}
+            Err(_) => return false,
+        }
+    }
 }
 
 /// Agree on a version, take the client's name for the usage log, and record the session's start.
@@ -154,8 +189,8 @@ fn initialize(host: &Host, caller: &Caller, params: &Value) -> (Value, Caller) {
         next.id.client = clip(params["clientInfo"]["name"].as_str().unwrap_or("unknown"));
         next.id.client_v = params["clientInfo"]["version"].as_str().map(clip);
     }
-    let debug = host.config().mcp.debug;
-    let (client, client_v, tools, list_bytes) = (next.id.client.clone(), next.id.client_v.clone(), tools(debug).len() as u32, list_bytes(debug) as u64);
+    let listing = client::listing(host, &caller.env, host.config().mcp.debug);
+    let (client, client_v, tools, list_bytes) = (next.id.client.clone(), next.id.client_v.clone(), listing.tools.len() as u32, listing.bytes as u64);
     host.usage.record(&caller.env, &caller.id.sess, Event::Init { client, client_v, proto: proto.into(), tools, list_bytes });
     let reply = json!({"protocolVersion": proto, "capabilities": {"tools": {"listChanged": true}}, "serverInfo": {"name": "itse", "version": VERSION}, "instructions": text("instructions", &[])});
     (reply, next)
@@ -181,7 +216,10 @@ fn tool_call(host: &Arc<Host>, caller: &Caller, params: &Value, cancel: &Cancel)
             tokens.push(a["verb"].clone());
             "debug".to_string()
         }
-        name => return json!({"content": [{"type": "text", "text": format!("ERROR {name} — no such tool\n")}], "isError": true}),
+        name => {
+            let exposed = name.contains("__").then(|| client::call(host, caller, name, a.clone(), cancel)).flatten();
+            return exposed.unwrap_or_else(|| json!({"content": [{"type": "text", "text": format!("ERROR {name} — no such tool\n")}], "isError": true}));
+        }
     };
     if params["name"] != "show_result" {
         tokens.extend(a.get("target").map(token));

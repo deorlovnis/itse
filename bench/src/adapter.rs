@@ -35,6 +35,8 @@ pub struct Adapter {
     pub fields: BTreeMap<String, String>,
     /// Per arm, more `{name}` values: the MCP config, say.
     pub arms: BTreeMap<String, BTreeMap<String, String>>,
+    /// The itse extension `itse integrate` sets the harness up with in the with arm; none if unset.
+    pub integrate: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq)]

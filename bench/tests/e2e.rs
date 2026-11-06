@@ -202,7 +202,7 @@ fn a_run_records_both_arms_of_a_trial_and_the_report_pairs_them() {
     assert_eq!((with["pass"].as_bool(), with["check_exit"].as_i64()), (Some(true), Some(0)), "{with}");
     assert_eq!((with["shortstat"].as_str(), with["untracked"].as_u64()), (Some("1 file changed, 1 insertion(+), 1 deletion(-)"), Some(0)));
     let itse_block = &with["itse"];
-    assert_eq!((&itse_block["used"], &itse_block["trusted_by"], &itse_block["skill"]), (&serde_json::json!(["rust"]), &serde_json::json!("bench"), &Value::Null));
+    assert_eq!((&itse_block["used"], &itse_block["trusted_by"], &itse_block["skill"]), (&serde_json::json!(["rust"]), &serde_json::json!("bench"), &serde_json::json!(true)));
     assert!(itse_block["usage"]["calls"].as_u64() >= Some(1), "the fake's itse status, from the trial's own log: {itse_block}");
     assert!(itse_block["usage"]["by_verb"]["status"].as_u64() >= Some(1), "{itse_block}");
     assert_eq!(itse_block["usage"]["by_verb"].get("use"), None, "the bench's own calls are not counted");
@@ -223,6 +223,8 @@ fn a_run_records_both_arms_of_a_trial_and_the_report_pairs_them() {
     let skill_home = PathBuf::from(itse_block["skill_home"].as_str().unwrap());
     assert_eq!((skill_home.clone(), &without["itse"]["skill_home"]), (run_dir.join("rust-off-by-one-1-with/cfg"), &Value::Null));
     assert!(skill_home.join(".claude.seen").is_file());
+    let skill = fs::read_to_string(skill_home.join(".claude/skills/itse/SKILL.md")).unwrap();
+    assert!(skill.starts_with("---\nname: \"itse\"\n") && skill.contains("`itse show run:14/T1`"), "the skill is where the harness's config dir has it: {skill}");
     let with_seen = trial("with", "cfg/.claude.seen");
     assert!(with_seen.contains("\"command\":\"itse\"") && with_seen.contains("passed=yes\nblocked=\nleaked=\n"), "{with_seen}");
     assert!(with_seen.contains(&format!("itse={}", run_dir.join("rust-off-by-one-1-with/bin/itse").display())), "{with_seen}");

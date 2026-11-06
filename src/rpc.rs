@@ -34,7 +34,6 @@ pub enum Framing {
 
 /// How ids are matched, requests cancelled and errors shaped.
 #[derive(Clone, Copy, Debug, PartialEq)]
-#[allow(dead_code)] // the hosted MCP and DAP clients start the other two
 pub enum Dialect {
     Lsp,
     Mcp,
@@ -167,7 +166,8 @@ impl Peer {
     pub fn start(r: impl BufRead + Send + 'static, mut w: impl Write + Send + 'static, f: Framing, d: Dialect, h: Arc<dyn Handler>) -> Arc<Peer> {
         let (writer, frames) = mpsc::channel();
         let peer = Arc::new(Peer { writer, framing: f, dialect: d, next: AtomicI64::new(1), state: Mutex::default(), dap_cancel: AtomicBool::new(false) });
-        thread::spawn(move || frames.into_iter().try_for_each(|v: Value| write(&mut w, f, &v)));
+        // A null frame is the end of the stream: the writer is dropped, so the other side reads EOF.
+        thread::spawn(move || frames.into_iter().take_while(|v: &Value| !v.is_null()).try_for_each(|v| write(&mut w, f, &v)));
         let reader = peer.clone();
         thread::spawn(move || reader.read_loop(r, &*h));
         peer
@@ -231,13 +231,20 @@ impl Peer {
     }
 
     /// The dialect's goodbye before the process is stopped: LSP `shutdown` (waiting up to `wait`)
-    /// and `exit`. False when the dialect has none, so nobody waits for an exit.
+    /// and `exit`; MCP's stdio ends the stream. False when the dialect has none, so nobody waits
+    /// for an exit.
     pub fn bye(&self, wait: Duration) -> bool {
-        if self.dialect != Dialect::Lsp || self.closed().is_some() {
+        if self.closed().is_some() {
             return false;
         }
-        let _ = self.request("shutdown", Value::Null, wait, &Cancel::default());
-        self.notify("exit", Value::Null).is_ok()
+        match self.dialect {
+            Dialect::Lsp => {
+                let _ = self.request("shutdown", Value::Null, wait, &Cancel::default());
+                self.notify("exit", Value::Null).is_ok()
+            }
+            Dialect::Mcp => self.send(Value::Null).is_ok(),
+            Dialect::Dap => false,
+        }
     }
 
     /// A request, or without an id a notification. DAP has no notifications: there it is a request
