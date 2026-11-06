@@ -56,6 +56,8 @@ pub struct Host {
     pub slots: Mutex<BTreeMap<String, Arc<Slot>>>,
     /// `run:N` → the runs that haven't ended, started here or re-adopted.
     pub runs: Mutex<BTreeMap<String, Arc<Run>>>,
+    /// `dbg:N` → its debug session, until it is stopped, reaped or found gone.
+    pub debug: Mutex<BTreeMap<String, Arc<crate::dap::Session>>>,
     /// What `procs.json` holds: one record per live child, rewritten on every change.
     procs: Mutex<Vec<Value>>,
     /// The idle stops under way, each on a thread of its own: the daemon waits for them as it exits.
@@ -71,8 +73,9 @@ impl Host {
         let started_by = env::var("ITSE_STARTED_BY").ok().filter(|b| b == "mcp").unwrap_or_else(|| "cli".into());
         let (conns, last, stopping, bound) = (AtomicUsize::new(0), Mutex::new(Instant::now()), AtomicBool::new(false), Mutex::new(0));
         let (usage, sessions, base_env) = (Usage::new(&dirs, &ws.root, true), AtomicUsize::new(0), base_env(env::vars_os()));
-        let (slots, runs, procs, stops, started, idle) = (Mutex::default(), Mutex::default(), Mutex::default(), Mutex::default(), SystemTime::now(), Duration::from_secs(idle));
-        Self { ws, dirs, socket, started, started_by, exe, base_env, idle, conns, sessions, last, stopping, bound, usage, slots, runs, procs, stops }
+        let (slots, runs, debug, procs, stops, started, idle) =
+            (Mutex::default(), Mutex::default(), Mutex::default(), Mutex::default(), Mutex::default(), SystemTime::now(), Duration::from_secs(idle));
+        Self { ws, dirs, socket, started, started_by, exe, base_env, idle, conns, sessions, last, stopping, bound, usage, slots, runs, debug, procs, stops }
     }
 
     /// A handle's slot, made `Stopped` on first use.
@@ -149,16 +152,16 @@ impl Host {
         Session(self.clone())
     }
 
-    /// An attached MCP session or a live run keeps a replaced binary's daemon serving.
+    /// An attached MCP session, a live run or a live debug session keeps a replaced binary's daemon serving.
     pub fn busy(&self) -> bool {
-        self.sessions.load(Ordering::SeqCst) > 0 || !lock(&self.runs).is_empty()
+        self.sessions.load(Ordering::SeqCst) > 0 || !lock(&self.runs).is_empty() || !lock(&self.debug).is_empty()
     }
 
-    /// No connection, no live run and no server up, starting or stopping for the idle time.
+    /// No connection, no live run or debug session and no server up, starting or stopping for the idle time.
     pub fn idle(&self) -> bool {
         let stopping = || lock(&self.stops).iter().any(|t| !t.is_finished());
         let serving = || stopping() || lock(&self.slots).values().any(|s| !matches!(s.phase.try_lock().as_deref(), Ok(Phase::Stopped | Phase::Crashed(_) | Phase::Gone(_))));
-        self.conns.load(Ordering::SeqCst) == 0 && lock(&self.runs).is_empty() && lock(&self.last).elapsed() >= self.idle && !serving()
+        self.conns.load(Ordering::SeqCst) == 0 && lock(&self.runs).is_empty() && lock(&self.debug).is_empty() && lock(&self.last).elapsed() >= self.idle && !serving()
     }
 
     /// Stop a server and drop it from `procs.json`; false if it wasn't up.
@@ -172,7 +175,9 @@ impl Host {
     /// slot's lock, so no query gets it meanwhile, and stopped on a thread of its own, since a stop
     /// waits on the server. Nothing is restarted here: the next call that needs a server starts it.
     /// A server log past 4 MB starts afresh: a chatty server (or a `RA_LOG` passed down) fills no disk.
+    /// Debug sessions are reaped too.
     pub fn reap(self: &Arc<Self>) {
+        crate::dap::reap(self);
         let slots: Vec<(String, Arc<Slot>)> = lock(&self.slots).iter().map(|(h, s)| (h.clone(), s.clone())).collect();
         for (handle, slot) in slots {
             let Ok(mut phase) = slot.phase.try_lock() else { continue };
@@ -197,12 +202,15 @@ impl Host {
         }
     }
 
-    /// Stop every server at once, as the daemon exits; each gets `wait` for its goodbye, and an idle
-    /// stop under way gets to finish its own. A server still starting is in `procs.json` from its
-    /// spawn on, and its group and marked processes are killed from there.
+    /// Stop every server and end every debug session at once, as the daemon exits; each gets `wait`
+    /// for its goodbye (a session's `disconnect` its own 3 s), and an idle stop under way gets to
+    /// finish its own. A server still starting is in `procs.json` from its spawn on, and its group
+    /// and marked processes are killed from there.
     pub fn stop_servers(self: &Arc<Self>, wait: Duration) {
         let handles: Vec<String> = lock(&self.slots).keys().cloned().collect();
-        let stops: Vec<_> = handles.into_iter().map(|h| (self.clone(), h)).map(|(host, h)| thread::spawn(move || _ = host.stop_server(&h, wait))).collect();
+        let mut stops: Vec<_> = handles.into_iter().map(|h| (self.clone(), h)).map(|(host, h)| thread::spawn(move || _ = host.stop_server(&h, wait))).collect();
+        let debug: Vec<_> = lock(&self.debug).values().cloned().collect();
+        stops.extend(debug.into_iter().map(|s| (self.clone(), s)).map(|(host, s)| thread::spawn(move || s.end(&host, "is gone: the daemon stopped"))));
         let idle: Vec<_> = mem::take(&mut *lock(&self.stops));
         stops.into_iter().chain(idle).for_each(|t| drop(t.join()));
         let left: Vec<Value> = lock(&self.procs).iter().filter(|p| p["kind"] != "run" && p["pgid"].is_i64()).cloned().collect();
@@ -264,15 +272,12 @@ pub struct Launch {
     /// What it writes into the workspace itself, as declared.
     pub outputs: Vec<String>,
     pub idle_minutes: Option<u64>,
-    // The DAP and hosted MCP clients read these.
+    // The hosted MCP client reads these.
     #[allow(dead_code)]
     pub timeout_s: Option<u64>,
     #[allow(dead_code)]
     pub expose: bool,
-    #[allow(dead_code)]
     pub via: Option<DapVia>,
-    #[allow(dead_code)]
-    pub hide_vars: Vec<String>,
     /// It doesn't watch files itself: the disk sync also sends `didChangeWatchedFiles`.
     pub watch_client: bool,
 }

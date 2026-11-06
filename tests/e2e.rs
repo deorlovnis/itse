@@ -945,3 +945,8 @@ mod cargo;
 mod lsp;
 #[path = "e2e/ra.rs"]
 mod ra;
+
+// --- debug adapters ---
+
+#[path = "e2e/dap.rs"]
+mod dap;

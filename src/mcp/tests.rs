@@ -135,7 +135,8 @@ fn debug_tool_absent_unless_opted_in() {
     let other = TempDir::new("itse-mcp");
     let mut on = Session::new(&host(&other, Some(r#"{"mcp": {"debug": true}}"#)), &[]);
     assert_eq!(names(&mut on), ["test_build_run", "problems_symbols", "show_result", "debug"]);
-    assert_eq!(on.call("debug", json!({"verb": "test", "target": ":data"})), (true, "ERROR debug — not built yet\n".into()));
+    let none = "ERROR debug test :data — no extension in use declares how its tests run under a debugger (debug.adapter)\n";
+    assert_eq!(on.call("debug", json!({"verb": "test", "target": ":data"})), (true, none.into()), "the tool reaches the verb");
 }
 
 #[test]

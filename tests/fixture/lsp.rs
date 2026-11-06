@@ -8,7 +8,8 @@
 //! `{"encoding": "utf-16", "index_ms": 0, "slow_ms": 3000, "symbols": [{"name", "kind",
 //! "container", "path", "line", "character"}], "references": [{"path", "line", "character"}],
 //! "hover": "text", "check": false, "drop_saves": [2], "hierarchical": false, "links": false,
-//! "caps_off": ["definitionProvider"], "definition": {"path", "line", "character"}, "marker": "FIXTURE_ERROR"}`
+//! "caps_off": ["definitionProvider"], "definition": {"path", "line", "character"}, "marker": "FIXTURE_ERROR",
+//! "debug_port_as": "string" | "object" | "<host>"}`
 //!
 //! With `check`, it publishes only on a save, behind `$/progress` begin and end, as rust-analyzer's
 //! `cargo check` does, and ignores the saves `drop_saves` numbers (from 1). `hierarchical` answers
@@ -22,10 +23,13 @@
 //! once initialized; `oversize-frame` answers `workspace/symbol` with 5 MiB; `spawn-child` starts a
 //! `sleep` in a process group of its own once initialized, as rust-analyzer starts `cargo check`,
 //! and writes its pid to the log's path plus `.child`. A `workspace/symbol` query for
-//! `FIXTURE_CRASH` exits 3 mid-call.
+//! `FIXTURE_CRASH` exits 3 mid-call. `workspace/executeCommand` `start_debug_server` listens on
+//! 127.0.0.1 for one DAP connection, served as `itse-fixture dap` serves one, and answers with
+//! its port: a number, else as `debug_port_as` says (`"<host>"` answers `"<host>:<port>"`).
 
 use std::fs::{self, OpenOptions};
 use std::io::{self, BufRead, Write};
+use std::net::TcpListener;
 use std::os::unix::process::CommandExt;
 use std::process::{self, Command, ExitCode};
 use std::sync::{Arc, Mutex};
@@ -42,8 +46,8 @@ fn send(out: &Out, v: Value) {
     let _ = write!(out, "Content-Length: {}\r\n\r\n{body}", body.len()).and_then(|()| out.flush());
 }
 
-/// The next frame's body, or None at EOF.
-fn frame(r: &mut impl BufRead) -> Option<Vec<u8>> {
+/// The next frame's body, or None at EOF; the DAP fixture reads its frames with it too.
+pub fn frame(r: &mut impl BufRead) -> Option<Vec<u8>> {
     let mut len = None;
     loop {
         let mut line = String::new();
@@ -195,6 +199,21 @@ pub fn serve(mode: &str) -> ExitCode {
                 match at {
                     Some(l) if script["links"] == true => json!([{"targetUri": l["uri"], "targetRange": l["range"], "targetSelectionRange": l["range"]}]),
                     at => at.unwrap_or_default(),
+                }
+            }
+            "workspace/executeCommand" if p["command"] == "start_debug_server" => {
+                let Ok(listener) = TcpListener::bind("127.0.0.1:0") else { continue };
+                let (port, mode) = (listener.local_addr().map_or(0, |a| a.port()), mode.to_string());
+                thread::spawn(move || {
+                    if let Ok((conn, _)) = listener.accept() {
+                        crate::dap::session(io::BufReader::new(conn.try_clone().expect("a clone of the connection")), conn, &mode);
+                    }
+                });
+                match script["debug_port_as"].as_str() {
+                    Some("string") => json!(port.to_string()),
+                    Some("object") => json!({"port": port}),
+                    Some(host) => json!(format!("{host}:{port}")),
+                    None => json!(port),
                 }
             }
             "textDocument/hover" => script["hover"].as_str().map_or(Value::Null, |h| json!({"contents": {"kind": "plaintext", "value": h}})),

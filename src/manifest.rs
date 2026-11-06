@@ -15,7 +15,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
 use crate::host::{Limits, Protocol};
@@ -69,8 +69,28 @@ pub struct Extension {
     pub integration: Option<Value>,
     /// Hook recipes for `itse hook`; only read, so kept as JSON.
     pub hooks: Option<Value>,
-    /// `{project_packages: [...]}` for the default stop rule of `debug test`.
-    pub debug: Option<Value>,
+    pub debug: Option<Debug>,
+}
+
+/// How `debug test` runs the tests under a debugger: the `dap` server it uses and the request it
+/// sends (`launch`, so the adapter starts the tests), whose `arguments` take `${workspaceFolder}`,
+/// `${input:target}` and `${input:filter}`. `debug attach <host:port>` sends `attach` with
+/// `attach`. `project_packages` (class or module prefixes) scope the default stop on caught
+/// exceptions to project code, through `caught_condition`, the adapter's own condition syntax for
+/// its caught filter with `${packages}` (the prefixes, comma-separated); without one, every caught
+/// exception stops and those outside the project are continued past. A test run that waits for a
+/// debugger to attach (the JVM's) comes with the JVM transport; it will add the test action to run
+/// (its `target_args` and `filter_args` reused) and the ready line whose `${ready:1}` is the port
+/// that `attach` gets, so `debug test` attaches to `run:N` and its result says `test result in run:N`.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Debug {
+    pub adapter: String,
+    pub request: Option<String>,
+    pub arguments: Value,
+    pub attach: Value,
+    pub project_packages: Vec<String>,
+    pub caught_condition: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -145,7 +165,7 @@ pub struct Server {
 }
 
 /// How a DAP adapter is reached.
-#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum DapVia {
     Program,
@@ -452,7 +472,7 @@ pub fn parse_ext(text: &str, from: &str) -> Result<Extension> {
         for t in ext.servers.iter().flat_map(|s| s.command.iter().chain(s.env.values())) {
             render(t, &mut |_| Some(String::new()))?;
         }
-        for v in ext.servers.iter().flat_map(|s| [&s.init_options, &s.settings]) {
+        for v in ext.servers.iter().flat_map(|s| [&s.init_options, &s.settings]).chain(ext.debug.iter().flat_map(|d| [&d.arguments, &d.attach])) {
             render_value(v, &mut |_| Some(String::new()))?;
         }
         crate::parse::check(&ext)

@@ -17,9 +17,9 @@ use std::{env, fs, thread};
 use anyhow::{Result, anyhow};
 use serde_json::{Value, json};
 
-use crate::host::Launch;
+use crate::host::{Launch, Protocol};
 use crate::lock::{self, Consent, Lock};
-use crate::manifest::{Manifest, Package, SystemCheck, Use, render, render_value};
+use crate::manifest::{DapVia, Manifest, Package, SystemCheck, Use, render, render_value};
 use crate::results::{Outcome, State};
 use crate::sys;
 use crate::verbs::Args;
@@ -79,8 +79,14 @@ pub fn resolve_for(ws: &Workspace, dirs: &Dirs, env: &BTreeMap<String, String>, 
     let uses = m.uses();
     let mut code = Vec::new();
     for ext in uses.iter().filter_map(|u| m.exts.get(&u.id)).map(|e| &e.0) {
-        for s in ext.servers.iter().filter(|s| s.executes_project_code || m.packages_of(s, &uses).any(|p| p.executes_project_code)) {
-            code.push((s.id.clone(), json!({"server": s.id, "command": s.command, "env": s.env})));
+        // A debug adapter runs the project's code: it launches the tests (as `via` and the debug
+        // block say), or evaluates in them.
+        for s in ext.servers.iter().filter(|s| s.executes_project_code || s.protocol == Protocol::Dap || m.packages_of(s, &uses).any(|p| p.executes_project_code)) {
+            let mut c = json!({"server": s.id, "command": s.command, "env": s.env});
+            // What runs only: the stop rule's fields don't.
+            s.via.as_ref().inspect(|via| c["via"] = json!(via));
+            ext.debug.as_ref().filter(|d| d.adapter == s.id).inspect(|d| c["debug"] = json!({"request": d.request, "arguments": d.arguments, "attach": d.attach}));
+            code.push((s.id.clone(), c));
         }
         for a in ext.actions.iter().filter(|a| a.executes_project_code) {
             code.push((a.label.clone(), json!({"action": a.label, "command": a.command, "args": a.args, "cwd": a.options.cwd, "env": a.options.env})));
@@ -218,7 +224,11 @@ fn launches(cx: &Cx, m: &Manifest, uses: &[Use], roots: &BTreeMap<String, PathBu
             };
             let argv: Result<Vec<String>> = s.command.iter().map(|t| render(t, &mut fill)).collect();
             let env: Result<Vec<(String, String)>> = s.env.iter().map(|(k, v)| Ok((k.clone(), render(v, &mut fill)?))).collect();
-            let (Ok(argv), Ok(env)) = (argv, env) else { continue };
+            let via = match &s.via {
+                Some(DapVia::Tcp { argv, port }) => argv.iter().map(|t| render(t, &mut fill)).collect::<Result<_>>().map(|argv| Some(DapVia::Tcp { argv, port: *port })),
+                via => Ok(via.clone()),
+            };
+            let (Ok(argv), Ok(env), Ok(via)) = (argv, env, via) else { continue };
             // Before trust the team layer is read for status only, so its server settings wait too.
             let set = settings.get(&s.id).filter(|x| trusted || !x.1).map(|x| x.0);
             let lsp_settings = set.and_then(|x| x.settings.as_ref()).unwrap_or(&s.settings);
@@ -242,8 +252,7 @@ fn launches(cx: &Cx, m: &Manifest, uses: &[Use], roots: &BTreeMap<String, PathBu
                 idle_minutes: set.and_then(|x| x.idle_minutes).or(s.idle_minutes),
                 timeout_s: s.timeout_s,
                 expose: set.is_some_and(|x| x.expose),
-                via: s.via.clone(),
-                hide_vars: s.hide_vars.clone(),
+                via,
                 watch_client: s.watch.as_deref() == Some("client"),
             });
         }
