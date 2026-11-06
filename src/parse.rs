@@ -81,36 +81,28 @@ impl Live<'_> {
     /// Feed one line: a fixed multi-line pattern matches line by line, then up to `detail_lines`
     /// lines until a blank one; a line that breaks a pattern ends it and may start the next.
     fn feed(&mut self, root: &Path, line: &str, items: &mut Vec<Item>) {
+        let (len, extra) = (self.patterns.len(), self.m.detail_lines.unwrap_or(0));
         if let Some((i, item, limit)) = self.open.as_mut() {
-            if *i < self.patterns.len() {
-                if let Some(c) = self.patterns[*i].0.captures(line) {
-                    fill(root, self.m, self.patterns[*i].1, &c, item);
-                    (*i, *limit) = (*i + 1, item.detail.len() + self.m.detail_lines.unwrap_or(0));
-                    let whole = *i == self.patterns.len() && self.m.detail_lines.unwrap_or(0) == 0;
-                    return self.close(whole, items);
-                }
-                self.open = None;
-            } else if !line.trim().is_empty() && item.detail.len() < *limit {
+            if *i == len && !line.trim().is_empty() && item.detail.len() < *limit {
                 return item.detail.push(line.to_string());
-            } else {
-                self.close(true, items);
+            } else if *i == len {
+                items.extend(self.open.take().map(|o| o.1));
+            } else if !self.patterns[*i].0.is_match(line) {
+                self.open = None;
             }
         }
-        if let Some(c) = self.patterns.first().and_then(|p| p.0.captures(line)) {
+        if self.open.is_none() && self.patterns.first().is_some_and(|p| p.0.is_match(line)) {
             // A test item is the test's own; only a problem names the tool that reported it.
             let test = self.m.kind.as_deref() == Some("test");
-            let mut item =
-                Item { kind: (if test { "failed" } else { "error" }).into(), sources: vec![self.tool.clone()].into_iter().filter(|_| !test).collect(), ..Item::default() };
-            fill(root, self.m, self.patterns[0].1, &c, &mut item);
-            let limit = item.detail.len() + self.m.detail_lines.unwrap_or(0);
-            self.open = Some((1, item, limit));
-            // A one-line pattern without detail lines is whole at once.
-            self.close(self.patterns.len() == 1 && self.m.detail_lines.unwrap_or(0) == 0, items);
+            let sources = vec![self.tool.clone()].into_iter().filter(|_| !test).collect();
+            self.open = Some((0, Item { kind: (if test { "failed" } else { "error" }).into(), sources, ..Item::default() }, 0));
         }
-    }
-
-    fn close(&mut self, done: bool, items: &mut Vec<Item>) {
-        if done {
+        let Some((i, item, limit)) = self.open.as_mut() else { return };
+        let Some(c) = self.patterns[*i].0.captures(line) else { return };
+        fill(root, self.m, self.patterns[*i].1, &c, item);
+        (*i, *limit) = (*i + 1, item.detail.len() + extra);
+        // A pattern without detail lines is whole at its last line.
+        if *i == len && extra == 0 {
             items.extend(self.open.take().map(|o| o.1));
         }
     }
@@ -169,7 +161,7 @@ pub fn run(root: &Path, a: &Action, named: &BTreeMap<&str, &Matcher>, log: &Path
         }
         live.iter_mut().for_each(|l| l.feed(root, &line, &mut out.items));
     }
-    live.iter_mut().for_each(|l| l.close(l.open.as_ref().is_some_and(|o| o.0 == l.patterns.len()), &mut out.items));
+    out.items.extend(live.iter_mut().filter_map(|l| l.open.take().filter(|o| o.0 == l.patterns.len()).map(|o| o.1)));
     for it in &mut out.items {
         it.src.extend(it.loc.as_ref().and_then(|l| source(root, &l.path, l.line)));
     }
@@ -271,14 +263,13 @@ pub fn merge(items: Vec<Item>) -> Vec<Item> {
     const KINDS: [(&str, &str); 5] = [("error", "E"), ("failed", "T"), ("warning", "W"), ("info", "I"), ("hint", "H")];
     let rank = |k: &str| KINDS.iter().position(|(kind, _)| *kind == k).unwrap_or(0);
     out.sort_by_key(|(_, it)| (rank(&it.kind), it.loc.as_ref().map(|l| (l.path.clone(), l.line, l.col))));
-    let mut seen = BTreeMap::new();
-    let number = |mut it: Item| {
-        let prefix = KINDS[rank(&it.kind)].1;
-        let n = seen.entry(prefix).and_modify(|n| *n += 1).or_insert(1);
-        it.id = format!("{prefix}{n}");
-        it
-    };
-    out.into_iter().map(|(_, it)| it).map(number).collect()
+    let mut seen = [0; KINDS.len()];
+    for (_, it) in &mut out {
+        let r = rank(&it.kind);
+        seen[r] += 1;
+        it.id = format!("{}{}", KINDS[r].1, seen[r]);
+    }
+    out.into_iter().map(|(_, it)| it).collect()
 }
 
 /// `problems [scope] [--new] [--all]` over the newest result of each action and the diagnostics the
@@ -291,10 +282,8 @@ pub fn merge(items: Vec<Item>) -> Vec<Item> {
 /// are not counted fixed.
 pub fn problems(store: &Store, scope: &str, all: bool, new: bool, key: &str, pushed: &mut Pushed) -> Result<Outcome> {
     let (mut settled, held) = (pushed.settled, &pushed.held);
-    let mut runs: Vec<u64> = fs::read_dir(store.0.join("runs")).into_iter().flatten().flatten().filter_map(|e| e.file_name().to_str()?.parse().ok()).collect();
-    runs.sort_unstable_by(|a, b| b.cmp(a));
     let (mut labels, mut items, mut notes) = (BTreeSet::new(), std::mem::take(&mut pushed.items), Vec::new());
-    for n in runs {
+    for n in store.runs() {
         let dir = store.0.join(format!("runs/{n}"));
         // run.json is small; a result is read only for the newest ended run of each label.
         let Some(rec) = RunRecord::load(&dir).filter(|r| r.exit.is_some() && !labels.contains(&r.spec.label)) else { continue };
@@ -316,12 +305,8 @@ pub fn problems(store: &Store, scope: &str, all: bool, new: bool, key: &str, pus
     let view: Vec<(String, Item)> = merge(items).into_iter().filter(|i| shown(&i.kind, &path(i))).map(|i| (fingerprint(&i), i)).collect();
     let n = |items: &[Item], kind: &str| items.iter().filter(|i| i.kind == kind).count();
     let counts = |items: &[Item], new: &str| format!("{}, {}", plural(n(items, "error"), &format!("{new}error")), plural(n(items, "warning"), &format!("{new}warning")));
-    let (items, counts) = match new {
-        false => {
-            let items: Vec<Item> = view.into_iter().map(|(_, i)| i).collect();
-            let counts = counts(&items, "");
-            (items, counts)
-        }
+    let (tail, items) = match new {
+        false => (String::new(), view.into_iter().map(|(_, i)| i).collect::<Vec<_>>()),
         true => {
             let shown = |e: &[String]| shown(e.first().map_or("", String::as_str), e.get(1).map_or("", String::as_str));
             let held = |e: &[String]| e.iter().skip(2).any(|s| held.contains(s));
@@ -334,11 +319,11 @@ pub fn problems(store: &Store, scope: &str, all: bool, new: bool, key: &str, pus
             let fresh: Vec<Item> = view.iter().filter(|(f, _)| !before.fingerprints.contains_key(f)).map(|(_, i)| i.clone()).collect();
             let fixed = before.fingerprints.iter().filter(|(f, e)| shown(e) && !held(e) && !view.iter().any(|(v, _)| v == *f)).count();
             let since = before.at.get(11..19).map_or(String::new(), |t| format!(" since {t}"));
-            let counts = format!("{}; {} unchanged, {fixed} fixed{since}", counts(&fresh, "new "), view.len() - fresh.len());
             notes.extend((!settled).then(|| "not settled: the baseline is not advanced".to_string()));
-            (fresh, counts)
+            (format!("; {} unchanged, {fixed} fixed{since}", view.len() - fresh.len()), fresh)
         }
     };
+    let counts = counts(&items, if new { "new " } else { "" }) + &tail;
     let verdict = if n(&items, "error") > 0 {
         Verdict::Fail
     } else if items.is_empty() {

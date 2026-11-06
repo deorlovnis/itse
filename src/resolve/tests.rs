@@ -268,6 +268,27 @@ fn system_checks_are_typed_and_a_team_command_waits_for_trust() {
 }
 
 #[test]
+fn a_check_whose_child_is_reaped_elsewhere_says_so() {
+    // SIGCHLD ignored reaps every child of the process, so the check runs in a test process of its own.
+    const NAME: &str = "resolve::tests::a_check_whose_child_is_reaped_elsewhere_says_so";
+    if std::env::var_os("ITSE_TEST_SIGCHLD_IGNORED").is_none() {
+        let out = std::process::Command::new(std::env::current_exe().unwrap()).args(["--exact", NAME]).env("ITSE_TEST_SIGCHLD_IGNORED", "1").output().unwrap();
+        let text = String::from_utf8_lossy(&out.stdout);
+        return assert!(out.status.success() && text.contains("1 passed"), "{text}{}", String::from_utf8_lossy(&out.stderr));
+    }
+    unsafe extern "C" {
+        fn signal(sig: i32, handler: usize) -> usize;
+    }
+    // SAFETY: SIG_IGN (1) for SIGCHLD (17) installs no handler.
+    unsafe { signal(17, 1) };
+    for cmd in [vec!["true"], vec!["sleep", "0.3"]] {
+        let check = SystemCheck { lib: None, cmd: cmd.iter().map(|s| s.to_string()).collect() };
+        let err = system_check(&check).unwrap_err();
+        assert!(err.starts_with(&format!("{}: ", cmd.join(" "))) && !err.contains("exit") && !err.contains("took over"), "{err}");
+    }
+}
+
+#[test]
 fn a_package_from_path_is_rooted_where_its_bin_path_starts() {
     let fx = Fx::new();
     fx.use_("jdk", &["install=path"]);

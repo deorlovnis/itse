@@ -103,11 +103,8 @@ pub fn trim(text: &str, class: &str, frames: Option<&Frames>, classify: &[Classi
         first = false;
     }
     out.extend((collapsed > 0).then(|| format!("… {collapsed} framework frames")));
-    out.extend(
-        classify
-            .iter()
-            .filter(|c| Regex::new(&c.regexp).is_ok_and(|re| re.is_match(text)))
-            .map(|c| format!("class: {}{}", c.class, c.note.as_ref().map_or(String::new(), |n| format!(" ({n})")))),
-    );
+    for c in classify.iter().filter(|c| Regex::new(&c.regexp).is_ok_and(|re| re.is_match(text))) {
+        out.push(format!("class: {}{}", c.class, c.note.as_ref().map_or(String::new(), |n| format!(" ({n})"))));
+    }
     (out, loc, cut)
 }

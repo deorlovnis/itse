@@ -153,8 +153,10 @@ pub struct Server {
     pub adapter_id: Option<String>,
     pub via: Option<DapVia>,
     pub hide_vars: Vec<String>,
-    /// `"client"` also sends `workspace/didChangeWatchedFiles`.
-    pub watch: Option<String>,
+    /// Accepted and ignored, so an extension added while `"watch": "client"` still did something
+    /// keeps reading, and `ext remove` and `unuse` still work on it.
+    #[allow(dead_code)]
+    watch: Option<String>,
     pub limits: Limits,
     pub idle_minutes: Option<u64>,
     pub timeout_s: Option<u64>,

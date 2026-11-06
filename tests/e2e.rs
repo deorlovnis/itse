@@ -880,20 +880,20 @@ fn stats_calls_are_not_counted() {
 // --- the verb index ---
 
 #[test]
-fn itse_verbs_md_has_a_row_per_indexed_verb() {
+fn itse_verbs_has_an_entry_per_indexed_verb() {
     let env = Env::new();
-    let out = env.itse(&env.work(), &["verbs", "--md"]);
+    let out = env.itse(&env.work(), &["verbs"]);
     assert!(out.status.success());
-    let md = stdout(&out);
-    let index = stdout(&env.itse(&env.work(), &["verbs"]));
+    let index = stdout(&out);
     assert!(index.contains("itse test [target] [filter] [--action V]\n") && !index.contains("integrate") && !index.contains("trust"), "{index}");
     let v: Value = serde_json::from_slice(&env.itse(&env.work(), &["verbs", "--json"]).stdout).unwrap();
     let verbs = v["verbs"].as_array().unwrap();
     assert!(verbs.iter().any(|v| v["name"] == "show" && v["tool"] == "show_result"));
-    let rows: Vec<&str> = md.lines().filter(|l| l.starts_with("| `")).collect();
-    assert_eq!(rows.len(), verbs.len(), "{md}");
+    let rows: Vec<&str> = index.lines().filter(|l| l.starts_with("itse ")).collect();
+    assert_eq!(rows.len(), verbs.len(), "{index}");
     for v in verbs {
-        assert!(rows.iter().any(|r| r.starts_with(&format!("| `{}` |", v["name"].as_str().unwrap()))), "{} has a row: {md}", v["name"]);
+        let name = v["name"].as_str().unwrap();
+        assert!(rows.iter().any(|r| *r == format!("itse {name}") || r.starts_with(&format!("itse {name} "))), "{name} has an entry: {index}");
     }
     assert!(env.daemons().is_empty(), "the index never starts a daemon");
 }

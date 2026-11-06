@@ -180,7 +180,7 @@ pub fn serve_conn(stream: UnixStream, host: &Arc<Host>) {
     });
 }
 
-fn respond(writer: &Mutex<UnixStream>, id: Value, reply: Result<Value, Value>) {
+pub fn respond(writer: &Mutex<impl std::io::Write>, id: Value, reply: Result<Value, Value>) {
     let key = if reply.is_ok() { "result" } else { "error" };
     let _ = rpc::write(&mut *lock(writer), Framing::Lines, &json!({"jsonrpc": "2.0", "id": id, (key): reply.unwrap_or_else(|e| e)}));
 }

@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::results::{Cost, Outcome, Store, Verdict};
-use crate::{host, host::Host, host::Limits, host::Next, manifest::Action, manifest::OneOrMany, manifest::render, resolve::Resolved, rpc::Cancel, sys, sys::lock};
+use crate::{host, host::Host, host::Limits, manifest::Action, manifest::OneOrMany, manifest::render, resolve::Resolved, rpc::Cancel, sys, sys::lock};
 
 #[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
@@ -155,7 +155,7 @@ fn expand<'a>(declared: &[&'a Action], label: &str, path: &mut Vec<String>, out:
 /// Write `run.json`, start `/proc/self/exe __run <dir>` in its own session with `env` (which goes
 /// on the `Command` only), add it to `procs.json`, and watch it on a thread.
 pub fn start(host: &Arc<Host>, label: &str, plan: &Plan, env: &BTreeMap<String, String>) -> Result<Arc<Run>> {
-    let (handle, started_at) = (Next::take(&host.ws.state_dir(&host.dirs), "run")?, sys::utc(SystemTime::now()));
+    let (handle, started_at) = (host::Next::take(&host.ws.state_dir(&host.dirs), "run")?, sys::utc(SystemTime::now()));
     let dir = host.ws.state_dir(&host.dirs).join("runs").join(&handle[4..]);
     sys::private_dir(&dir)?;
     let started_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
@@ -254,10 +254,8 @@ pub fn stop_run(run: &Run) {
     let (steps, first) = ([(child, sys::SIGINT), (-run.pgid, sys::SIGTERM), (-run.pgid, sys::SIGKILL)], !run.stopping.swap(true, SeqCst));
     for (pid, signal) in steps.into_iter().filter(|_| first && run.pgid > 1).take_while(|_| live()) {
         sys::send_signal(pid, signal);
-        let end = Instant::now() + Duration::from_millis(env::var("ITSE_TEST_GRACE_MS").ok().filter(|_| cfg!(debug_assertions)).and_then(|ms| ms.parse().ok()).unwrap_or(5000));
-        while live() && Instant::now() < end {
-            thread::sleep(Duration::from_millis(20));
-        }
+        let grace = env::var("ITSE_TEST_GRACE_MS").ok().filter(|_| cfg!(debug_assertions)).and_then(|ms| ms.parse().ok()).unwrap_or(5000);
+        sys::wait_until(Duration::from_millis(grace), || !live());
     }
     run.ended(Duration::from_secs(2));
 }

@@ -126,6 +126,16 @@ fn parse_stat(text: &str) -> Option<ProcStat> {
     Some(ProcStat { state, pgid: fields.nth(1)?.parse().ok()?, start_time: fields.nth(16)?.parse().ok()? })
 }
 
+/// Poll `done` every 20 ms for up to `limit`; whether it came true.
+pub fn wait_until(limit: Duration, mut done: impl FnMut() -> bool) -> bool {
+    let (end, mut ok) = (Instant::now() + limit, done());
+    while !ok && Instant::now() < end {
+        thread::sleep(Duration::from_millis(20));
+        ok = done();
+    }
+    ok
+}
+
 /// SIGTERM to the group, then SIGKILL to whatever is left after `grace`. `reap` is a non-blocking
 /// wait on the leader when it is our child: its zombie still counts as a member until reaped.
 pub fn kill_group(pgid: i32, grace: Duration, mut reap: impl FnMut()) {
@@ -134,15 +144,13 @@ pub fn kill_group(pgid: i32, grace: Duration, mut reap: impl FnMut()) {
         return;
     }
     send_signal(-pgid, SIGTERM);
-    let end = Instant::now() + grace;
-    while Instant::now() < end {
+    let gone = wait_until(grace, || {
         reap();
-        if !send_signal(-pgid, 0) {
-            return;
-        }
-        thread::sleep(Duration::from_millis(20));
+        !send_signal(-pgid, 0)
+    });
+    if !gone {
+        send_signal(-pgid, SIGKILL);
     }
-    send_signal(-pgid, SIGKILL);
 }
 
 /// Lock a mutex even if a panicking thread poisoned it, so one panic can't disable a server for

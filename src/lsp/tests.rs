@@ -1,4 +1,5 @@
 use std::os::unix::net::UnixStream;
+use std::process::{Command, Stdio};
 use std::thread;
 
 use super::*;
@@ -409,12 +410,8 @@ fn unopened_files_are_opened_and_saved_from_a_lockless_git_status() {
         fs::write(&c, "fn c() {}\n").unwrap();
         File::options().write(true).open(&c).unwrap().set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000 + n)).unwrap();
     }
-    ask.launch.watch_client = true;
     let mut told = ask.sync();
     told.sort();
-    fake.docs(0);
-    let watched: Vec<Value> = lock(&fake.seen).iter().filter(|m| m["method"] == "workspace/didChangeWatchedFiles").map(|m| m["params"]["changes"].clone()).collect();
-    assert!(watched.len() == 1 && watched[0].as_array().unwrap().len() == 50 && watched[0][0]["type"] == 2, "watch: client also tells its watchers: {watched:?}");
     let mut newest: Vec<PathBuf> = (5..55).map(|n| tmp.0.join(format!("c{n}.rs"))).collect();
     newest.sort();
     assert_eq!(told, newest, "50 didSaves at most per sync, the newest");
@@ -789,4 +786,22 @@ fn a_byte_column_becomes_the_servers_column_and_back() {
     assert_eq!((server_col(line, x, false), server_col(line, x, true)), (x, x - 1 - 2));
     assert_eq!(byte_col(line, server_col(line, x, true) as u32, true), x);
     assert_eq!(server_col(line, 5, true), server_col(line, 4, true), "inside a char counts from its start");
+}
+
+#[test]
+fn a_server_without_a_command_fails_before_its_logs_turn_over() {
+    let tmp = TempDir::new("itse-lsp");
+    let vars: BTreeMap<&str, std::ffi::OsString> = [("HOME", tmp.0.join("home").into_os_string())].into();
+    let dirs = crate::workspace::Dirs::from_env(|k| vars.get(k).cloned()).unwrap();
+    let ws = crate::workspace::Workspace::find(Some(tmp.0.clone()), &tmp.0).unwrap();
+    let socket = ws.socket(&dirs, &tmp.0).unwrap();
+    let host = Host::new(ws, dirs, socket, (0, 0));
+    let dir = host.ws.state_dir(&host.dirs).join("servers");
+    sys::private_dir(&dir).unwrap();
+    fs::write(dir.join("fixture.log"), "last real log\n").unwrap();
+    fs::write(dir.join("fixture.log.1"), "older log\n").unwrap();
+    let failed = start(&host, &Slot::default(), &Launch { id: "fixture".into(), ..Launch::default() }, &BTreeMap::new()).err().map(|e| e.to_string());
+    assert_eq!(failed.as_deref(), Some("fixture has no command"));
+    let logs = (fs::read_to_string(dir.join("fixture.log")).ok(), fs::read_to_string(dir.join("fixture.log.1")).ok());
+    assert_eq!(logs, (Some("last real log\n".into()), Some("older log\n".into())), "the logs stay as they were");
 }

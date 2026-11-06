@@ -320,6 +320,13 @@ fn a_self_closing_tag_longer_than_the_tag_cap_still_closes() {
 }
 
 #[test]
+fn failure_text_at_its_cap_keeps_a_later_cdata_section_out() {
+    let doc = format!("<testsuite><testcase name=\"a\"><failure>{}<![CDATA[{}]]></failure></testcase></testsuite>", "t".repeat(8192), "c".repeat(8192));
+    let cases = junit::scan(doc.as_bytes()).unwrap();
+    assert_eq!((cases[0].text.len(), cases[0].text.contains('c')), (8192, false), "at most 8 KB of failure text per test case");
+}
+
+#[test]
 fn only_the_newest_stale_reports_are_read() {
     let tmp = TempDir::new("itse-parse");
     write_report(&tmp.0, "data/build/test-results/test/TEST-A.xml", GRADLE_REPORT, Duration::from_secs(60));
