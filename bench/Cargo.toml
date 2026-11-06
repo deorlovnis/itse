@@ -1,0 +1,20 @@
+[package]
+name = "itse-bench"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.92"
+description = "The with/without-Itse baseline for coding-agent harnesses"
+publish = false
+
+# Not a workspace member and never linked into itse: it drives the built binaries.
+[workspace]
+
+[dependencies]
+anyhow = "1.0.104"
+lexopt = "0.3.2"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+sha2 = "0.11.1"
+
+[lints.rust]
+unsafe_code = "forbid"

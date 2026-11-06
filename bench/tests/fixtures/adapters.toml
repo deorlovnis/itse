@@ -1,0 +1,99 @@
+# A stand-in harness for the self-tests: fake.sh edits the workspace deterministically per arm
+# and prints a Claude-shaped JSON line. It spends nothing.
+[fake]
+version_cmd = ["sh", "{adapter_dir}/fake.sh", "--version"]
+command = ["sh", "{adapter_dir}/fake.sh", "{arm}", "{task_dir}", "{mcp_config}", "{instruction}"]
+parser = "json-last"
+pass_env = ["FAKE_PASSED"]
+require_env = ["FAKE_PASSED"]
+
+[fake.env]
+CLAUDE_CONFIG_DIR = "{cfg}/.claude"
+
+[fake.fields]
+cost_usd = "/total_cost_usd"
+turns = "/num_turns"
+fresh_tokens = "/usage/input_tokens"
+cache_read_tokens = "/usage/cache_read_input_tokens"
+cache_write_tokens = "/usage/cache_creation_input_tokens"
+output_tokens = "/usage/output_tokens"
+
+[fake.arms.with]
+mcp_config = '{"mcpServers":{"itse":{"type":"stdio","command":"itse","args":["mcp"]}}}'
+
+[fake.arms.without]
+mcp_config = '{"mcpServers":{}}'
+
+# Rewrites the task's verifier to pass, as an unsandboxed agent could; the bench must notice.
+[tamper]
+version_cmd = ["sh", "-c", "echo tamper 1.0"]
+command = ["sh", "-c", "printf 'exit 0\\n' >\"$0/tests/test.sh\"", "{task_dir}"]
+parser = "none"
+
+[tamper.arms.with]
+[tamper.arms.without]
+
+# A harness that cannot start: the trial's daemon must stop all the same.
+[broken]
+version_cmd = ["sh", "-c", "echo broken 1.0"]
+command = ["/nonexistent-harness"]
+parser = "none"
+
+[broken.arms.with]
+[broken.arms.without]
+
+# Leaves an fsmonitor and a clean filter in the repo's config that would run whenever git looks at
+# the worktree; the filter would also hide the README change from the shortstat.
+[fsmonitor]
+version_cmd = ["sh", "-c", "echo fsmonitor 1.0"]
+command = ["sh", "-c", 'git config core.fsmonitor "touch $0/fsmonitor-ran; false"; git config filter.x.clean "touch $0/filter-ran; git show HEAD:README.md"; echo "* filter=x" >.gitattributes; echo more >>README.md', "{trial}"]
+parser = "none"
+
+[fsmonitor.arms.with]
+[fsmonitor.arms.without]
+
+# Exits at once without a result, as a harness that cannot log in does: a harness error.
+[fails]
+version_cmd = ["sh", "-c", "echo fails 1.0"]
+command = ["sh", "-c", "echo 'not logged in' >&2; exit 7"]
+parser = "json-last"
+
+[fails.fields]
+turns = "/num_turns"
+
+[fails.arms.with]
+[fails.arms.without]
+
+# Prints what Claude Code prints when its login fails: one turn, no tokens, is_error.
+[autherr]
+version_cmd = ["sh", "-c", "echo autherr 1.0"]
+command = ["sh", "-c", 'echo "{\"type\":\"result\",\"is_error\":true,\"num_turns\":1,\"result\":\"Invalid API key\",\"usage\":{\"input_tokens\":0,\"output_tokens\":0}}"; exit 1']
+parser = "json-last"
+
+[autherr.fields]
+turns = "/num_turns"
+is_error = "/is_error"
+fresh_tokens = "/usage/input_tokens"
+output_tokens = "/usage/output_tokens"
+
+[autherr.arms.with]
+[autherr.arms.without]
+
+# Starts the trial's daemon and then sleeps, for a Ctrl-C to land in.
+[sleepy]
+version_cmd = ["sh", "-c", "echo sleepy 1.0"]
+command = ["sh", "-c", 'itse status >/dev/null 2>&1; touch "$0/started"; exec sleep 30', "{trial}"]
+parser = "none"
+
+[sleepy.arms.with]
+[sleepy.arms.without]
+
+# Leaves a detached process behind, which the bench kills and records. It waits until the process
+# is in its own session, so the end of the harness's group can't take it along.
+[escape]
+version_cmd = ["sh", "-c", "echo escape 1.0"]
+command = ["sh", "-c", "setsid sh -c 'echo $$ >\"$0\"; exec sleep 60' \"$0/escaped\" >/dev/null 2>&1 & while [ ! -s \"$0/escaped\" ]; do sleep 0.05; done", "{trial}"]
+parser = "none"
+
+[escape.arms.with]
+[escape.arms.without]

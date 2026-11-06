@@ -14,6 +14,8 @@ cargo install --path . --bin itse     # itse-fixture is test-only and never inst
 cargo test
 ```
 
+`bench/` holds itse-bench, a separate crate that runs coding-agent harnesses on the same tasks with and without itse and compares the two; see `bench/README.md`.
+
 ## State
 
 Itse keeps everything in `~/.config/itse`, `~/.local/share/itse`, `~/.local/state/itse` and `~/.cache/itse` (or the `XDG_*_HOME` equivalents), never in a workspace.
