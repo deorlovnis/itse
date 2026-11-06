@@ -64,7 +64,8 @@ pub fn check(ext: &Extension) -> Result<()> {
             regex(re, &a.label)?;
         }
     }
-    Ok(())
+    // A pattern that can't compile would hide nothing.
+    ext.servers.iter().try_for_each(|s| s.hide_vars.iter().try_for_each(|h| regex(h, &format!("{} hide_vars", s.id)).map(drop)))
 }
 
 /// A matcher in use: its compiled patterns, and the item it is part way through (the next pattern

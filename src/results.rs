@@ -184,7 +184,7 @@ impl Outcome {
             let loc = it.loc.as_ref().map(|l| format!("{}:{}:{}", l.path, l.line, l.col)).unwrap_or_default();
             let sources = if it.sources.is_empty() { String::new() } else { format!("[{}]", it.sources.join(", ")) };
             let mut lines = vec![[&it.id, &it.kind, &loc, &it.msg, &sources].iter().filter(|s| !s.is_empty()).map(|s| s.as_str()).collect::<Vec<_>>().join(" ")];
-            lines.extend(it.src.iter().map(|(n, t)| format!("{n:>7} | {}", clip(t))));
+            lines.extend(it.src.iter().map(|(n, t)| format!("{n:>7} | {}", clip(t, 160))));
             let shown = if whole { it.detail.len() } else { it.detail.len().min(DETAIL) };
             lines.extend(it.detail[..shown].iter().map(|d| format!("   {d}")));
             if shown < it.detail.len() {
@@ -247,14 +247,15 @@ fn kept<T: Clone>(all: &[T], keep: impl Fn(usize) -> bool) -> Vec<T> {
     all.iter().enumerate().filter(|(i, _)| keep(*i)).map(|(_, x)| x.clone()).collect()
 }
 
-/// A source line as printed: tabs as 4 spaces, at most 160 chars.
-fn clip(line: &str) -> String {
+/// A line as printed: tabs as 4 spaces, at most `max` chars, the last one `…` when cut.
+pub fn clip(line: &str, max: usize) -> String {
     let line = line.replace('\t', "    ");
-    if line.chars().count() <= 160 { line } else { line.chars().take(159).collect::<String>() + "…" }
+    if line.chars().count() <= max { line } else { line.chars().take(max - 1).collect::<String>() + "…" }
 }
 
-/// A workspace's stored results under its state dir: `results/<n>.json` for queries, and
-/// `runs/<n>/result.json` for actions. Kept: the newest 200 or 512 MiB.
+/// A workspace's stored results under its state dir: `results/<n>.json` for queries,
+/// `runs/<n>/result.json` for actions and `debug/<n>/result.json` for debug sessions. Kept: the
+/// newest 200 queries or 512 MiB.
 pub struct Store(pub PathBuf);
 
 impl Store {
@@ -280,6 +281,8 @@ impl Store {
         match id.split_once(':').filter(|(_, n)| n.parse::<u64>().is_ok())? {
             ("q", n) => Some(self.0.join("results").join(format!("{n}.json"))),
             ("run", n) => Some(self.0.join("runs").join(n).join("result.json")),
+            // A debug session's last snapshot, which outlives the session.
+            ("dbg", n) => Some(self.0.join("debug").join(n).join("result.json")),
             _ => None,
         }
     }

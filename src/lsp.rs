@@ -287,7 +287,7 @@ fn uri(path: &Path) -> String {
 
 /// The path of a `file:` URI, however the server encoded it: `file:///p`, `file://localhost/p` or
 /// `file:/p` (Java's `File.toURI`); always absolute.
-fn path_of(uri: &str) -> Option<PathBuf> {
+pub fn path_of(uri: &str) -> Option<PathBuf> {
     let rest = uri.strip_prefix("file:")?;
     let rest = Some(rest.strip_prefix("//localhost").or_else(|| rest.strip_prefix("//")).unwrap_or(rest)).filter(|r| r.starts_with('/'))?;
     let (b, mut out, mut i) = (rest.as_bytes(), Vec::new(), 0);

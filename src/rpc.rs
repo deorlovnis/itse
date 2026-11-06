@@ -207,6 +207,21 @@ impl Peer {
         Err(err)
     }
 
+    /// A request sent now, whose answer comes on the receiver (closed, if the reader has ended or
+    /// ends): for an answer awaited later, as DAP's `launch`, which some adapters answer only after
+    /// `configurationDone`. Nothing cancels it.
+    pub fn send_request(&self, method: &str, params: Value) -> mpsc::Receiver<Result<Value, RpcError>> {
+        let (id, (tx, rx)) = (self.next.fetch_add(1, Ordering::SeqCst), mpsc::channel());
+        let mut state = lock(&self.state);
+        match state.1.clone() {
+            Some(why) => drop(tx.send(Err(RpcError::Closed(why)))),
+            None => drop(state.0.insert(id, tx)),
+        }
+        drop(state);
+        let _ = self.send(self.message(Some(id), method, params));
+        rx
+    }
+
     pub fn notify(&self, method: &str, params: Value) -> io::Result<()> {
         self.send(self.message(None, method, params))
     }

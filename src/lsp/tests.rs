@@ -5,6 +5,19 @@ use super::*;
 use crate::rpc::{self, MAX_FRAME};
 use crate::sys::tests::TempDir;
 
+/// git for a test's own temp repo, with its HOME and identity and no system config. A git hook
+/// that runs the tests exports GIT_DIR and friends (an absolute GIT_DIR from a worktree), which
+/// would point every call at the caller's repo, so no `GIT_*` var of ours reaches it.
+fn test_git(dir: &Path, home: &Path, args: &[&str]) -> Command {
+    let mut cmd = Command::new("git");
+    for (key, _) in std::env::vars_os().filter(|(k, _)| k.to_string_lossy().starts_with("GIT_")) {
+        cmd.env_remove(key);
+    }
+    let ident = [("GIT_AUTHOR_NAME", "t"), ("GIT_AUTHOR_EMAIL", "t@t"), ("GIT_COMMITTER_NAME", "t"), ("GIT_COMMITTER_EMAIL", "t@t"), ("GIT_CONFIG_NOSYSTEM", "1")];
+    cmd.args(args).current_dir(dir).env("HOME", home).envs(ident);
+    cmd
+}
+
 /// The server's side of an in-process pair: every message the client sent, and its writer, so a
 /// test can push notifications and requests as a server would. It answers requests with `answer`.
 struct Fake {
@@ -338,17 +351,8 @@ fn opened_documents_are_kept_50_at_most_and_big_files_refused() {
 fn unopened_files_are_opened_and_saved_from_a_lockless_git_status() {
     let tmp = TempDir::new("itse-lsp");
     let git = |args: &[&str]| {
-        let ident = [("GIT_AUTHOR_NAME", "t"), ("GIT_AUTHOR_EMAIL", "t@t"), ("GIT_COMMITTER_NAME", "t"), ("GIT_COMMITTER_EMAIL", "t@t"), ("GIT_CONFIG_NOSYSTEM", "1")];
         // The test's own git runs no fsmonitor either.
-        let git = Command::new("git")
-            .args(["-c", "core.fsmonitor=false"])
-            .args(args)
-            .current_dir(&tmp.0)
-            .env("HOME", &tmp.0)
-            .envs(ident)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
+        let git = test_git(&tmp.0, &tmp.0, &["-c", "core.fsmonitor=false"]).args(args).stdout(Stdio::null()).stderr(Stdio::null()).status();
         git.is_ok_and(|s| s.success())
     };
     fs::write(tmp.0.join("a.rs"), "fn a() {}\n").unwrap();
@@ -423,8 +427,7 @@ fn a_sync_runs_none_of_the_commands_the_repos_config_names() {
     let tmp = TempDir::new("itse-lsp");
     let (root, sub) = (tmp.0.clone(), tmp.0.join("sub"));
     let git = |dir: &Path, args: &[&str]| {
-        let ident = [("GIT_AUTHOR_NAME", "t"), ("GIT_AUTHOR_EMAIL", "t@t"), ("GIT_COMMITTER_NAME", "t"), ("GIT_COMMITTER_EMAIL", "t@t"), ("GIT_CONFIG_NOSYSTEM", "1")];
-        let git = Command::new("git").args(args).current_dir(dir).env("HOME", &root).envs(ident).stdout(Stdio::null()).stderr(Stdio::null()).status();
+        let git = test_git(dir, &root, args).stdout(Stdio::null()).stderr(Stdio::null()).status();
         git.is_ok_and(|s| s.success())
     };
     let write = |path: &Path, text: &str| fs::create_dir_all(path.parent().unwrap()).and_then(|()| fs::write(path, text)).unwrap();
@@ -475,16 +478,7 @@ fn a_sync_in_a_partial_clone_fetches_nothing_through_the_repos_remote() {
     let tmp = TempDir::new("itse-lsp");
     let (src, cl, ran) = (tmp.0.join("src"), tmp.0.join("cl"), tmp.0.join("ran"));
     let git = |dir: &Path, args: &[&str]| {
-        let ident = [("GIT_AUTHOR_NAME", "t"), ("GIT_AUTHOR_EMAIL", "t@t"), ("GIT_COMMITTER_NAME", "t"), ("GIT_COMMITTER_EMAIL", "t@t"), ("GIT_CONFIG_NOSYSTEM", "1")];
-        let git = Command::new("git")
-            .args(["-c", "core.fsmonitor=false"])
-            .args(args)
-            .current_dir(dir)
-            .env("HOME", &tmp.0)
-            .envs(ident)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
+        let git = test_git(dir, &tmp.0, &["-c", "core.fsmonitor=false"]).args(args).stdout(Stdio::null()).stderr(Stdio::null()).status();
         git.is_ok_and(|s| s.success())
     };
     fs::create_dir_all(src.join("d")).unwrap();
@@ -510,8 +504,7 @@ fn a_sync_in_a_partial_clone_fetches_nothing_through_the_repos_remote() {
 fn a_link_to_a_device_or_a_fifo_is_never_read_by_a_sync_or_an_open() {
     let tmp = TempDir::new("itse-lsp");
     let git = |args: &[&str]| {
-        let ident = [("GIT_AUTHOR_NAME", "t"), ("GIT_AUTHOR_EMAIL", "t@t"), ("GIT_COMMITTER_NAME", "t"), ("GIT_COMMITTER_EMAIL", "t@t"), ("GIT_CONFIG_NOSYSTEM", "1")];
-        let git = Command::new("git").args(["-c", "core.fsmonitor=false"]).args(args).current_dir(&tmp.0).env("HOME", &tmp.0).envs(ident).stderr(Stdio::null()).output();
+        let git = test_git(&tmp.0, &tmp.0, &["-c", "core.fsmonitor=false"]).args(args).stderr(Stdio::null()).output();
         git.is_ok_and(|o| o.status.success())
     };
     fs::write(tmp.0.join("a.rs"), "fn a() {}\n").unwrap();
@@ -651,11 +644,11 @@ fn ra_crate(root: &Path, broken: bool) -> bool {
     fs::write(root.join("Cargo.toml"), "[package]\nname = \"ra-ws\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\n").unwrap();
     fs::write(root.join("src/lib.rs"), lib_rs(broken, 0)).unwrap();
     fs::write(root.join("src/extra.rs"), extra_rs(false, 0)).unwrap();
-    let run = |cmd: &str, args: &[&str]| {
-        let ident = [("GIT_AUTHOR_NAME", "t"), ("GIT_AUTHOR_EMAIL", "t@t"), ("GIT_COMMITTER_NAME", "t"), ("GIT_COMMITTER_EMAIL", "t@t"), ("GIT_CONFIG_NOSYSTEM", "1")];
-        Command::new(cmd).args(args).current_dir(root).envs(ident).stdout(Stdio::null()).stderr(Stdio::null()).status().is_ok_and(|s| s.success())
-    };
-    run("cargo", &["generate-lockfile", "--offline"]) && run("git", &["init", "-q"]) && run("git", &["add", "-A"]) && run("git", &["commit", "-qm", "init"])
+    let run = |mut cmd: Command| cmd.stdout(Stdio::null()).stderr(Stdio::null()).status().is_ok_and(|s| s.success());
+    let mut cargo = Command::new("cargo");
+    cargo.args(["generate-lockfile", "--offline"]).current_dir(root);
+    let git = |args: &[&str]| run(test_git(root, root, args));
+    run(cargo) && git(&["init", "-q"]) && git(&["add", "-A"]) && git(&["commit", "-qm", "init"])
 }
 
 fn lib_rs(broken: bool, n: usize) -> String {
