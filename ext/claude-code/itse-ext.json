@@ -10,7 +10,7 @@
   },
   "integration": {
     "config": { "env": "CLAUDE_CONFIG_DIR", "paths": { "~/.claude": "", "~/.claude.json": ".claude.json" } },
-    "skill": { "path": "~/.claude/skills/itse/SKILL.md", "name": "itse", "description": "Workspace facts from itse: tests, problems, symbols by name, debug snapshots" },
+    "skill": { "path": "~/.claude/skills/itse/SKILL.md", "name": "itse", "description": "Workspace facts from itse: tests, problems, symbols by name" },
     "mcp": {
       "add": ["claude", "mcp", "add-json", "itse", "${json}", "--scope", "local"],
       "remove": ["claude", "mcp", "remove", "itse", "--scope", "local"],

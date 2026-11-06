@@ -15,7 +15,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
 use crate::host::{Limits, Protocol};
@@ -69,28 +69,8 @@ pub struct Extension {
     pub integration: Option<Value>,
     /// Hook recipes for `itse hook`; only read, so kept as JSON.
     pub hooks: Option<Value>,
-    pub debug: Option<Debug>,
-}
-
-/// How `debug test` runs the tests under a debugger: the `dap` server it uses and the request it
-/// sends (`launch`, so the adapter starts the tests), whose `arguments` take `${workspaceFolder}`,
-/// `${input:target}` and `${input:filter}`. `debug attach <host:port>` sends `attach` with
-/// `attach`. `project_packages` (class or module prefixes) scope the default stop on caught
-/// exceptions to project code, through `caught_condition`, the adapter's own condition syntax for
-/// its caught filter with `${packages}` (the prefixes, comma-separated); without one, every caught
-/// exception stops and those outside the project are continued past. A test run that waits for a
-/// debugger to attach (the JVM's) comes with the JVM transport; it will add the test action to run
-/// (its `target_args` and `filter_args` reused) and the ready line whose `${ready:1}` is the port
-/// that `attach` gets, so `debug test` attaches to `run:N` and its result says `test result in run:N`.
-#[derive(Debug, Default, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct Debug {
-    pub adapter: String,
-    pub request: Option<String>,
-    pub arguments: Value,
-    pub attach: Value,
-    pub project_packages: Vec<String>,
-    pub caught_condition: Option<String>,
+    /// Accepted and ignored, as a server's retired keys are; read for the older trust hash too.
+    pub debug: Option<Value>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -150,37 +130,25 @@ pub struct Server {
     pub init_options: Value,
     /// What `workspace/configuration` and `didChangeConfiguration` get, by section.
     pub settings: Value,
-    pub adapter_id: Option<String>,
-    pub via: Option<DapVia>,
-    pub hide_vars: Vec<String>,
-    /// Accepted and ignored, so an extension added while `"watch": "client"` still did something
-    /// keeps reading, and `ext remove` and `unuse` still work on it.
+    /// Accepted and ignored, so an extension written for what itse no longer does keeps loading,
+    /// and `ext remove` and `unuse` still work on it: `"watch": "client"`, and the keys of a debug
+    /// adapter or an MCP server, whose servers are not started (`Protocol::Dap` and `Mcp`). `via`
+    /// is read for the trust hash an older itse took, so an upgrade keeps trust.
     #[allow(dead_code)]
-    watch: Option<String>,
+    watch: Option<Value>,
+    #[allow(dead_code)]
+    adapter_id: Option<Value>,
+    pub via: Option<Value>,
+    #[allow(dead_code)]
+    hide_vars: Option<Value>,
+    #[allow(dead_code)]
+    timeout_s: Option<Value>,
     pub limits: Limits,
     pub idle_minutes: Option<u64>,
-    pub timeout_s: Option<u64>,
     /// What the server itself writes into the workspace, like an action's `outputs`: rust-analyzer's
     /// `cargo metadata` makes a missing `Cargo.lock`.
     pub outputs: Vec<String>,
     pub executes_project_code: bool,
-}
-
-/// How a DAP adapter is reached.
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case", deny_unknown_fields)]
-pub enum DapVia {
-    Program,
-    Tcp {
-        argv: Vec<String>,
-        port: u16,
-    },
-    LspCommand {
-        server: String,
-        command: String,
-        #[serde(default)]
-        arguments: Vec<Value>,
-    },
 }
 
 /// A VS Code task entry, plus Itse's additions from `target_args` on.
@@ -377,9 +345,13 @@ pub struct SystemCheck {
 pub struct ServerSettings {
     pub idle_minutes: Option<u64>,
     pub settings: Option<Value>,
-    pub expose: bool,
-    pub tools: Option<Vec<String>>,
-    pub max_list_bytes: Option<usize>,
+    /// Accepted and ignored: what chose a hosted MCP server's tools.
+    #[allow(dead_code)]
+    expose: Option<Value>,
+    #[allow(dead_code)]
+    tools: Option<Value>,
+    #[allow(dead_code)]
+    max_list_bytes: Option<Value>,
 }
 
 /// A VS Code `inputs` entry.
@@ -401,13 +373,9 @@ pub struct Config {
     pub usage: Option<bool>,
     pub daemon_idle_minutes: Option<u64>,
     pub server_idle_minutes: Option<u64>,
-    pub mcp: McpConfig,
-}
-
-#[derive(Debug, Default, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct McpConfig {
-    pub debug: bool,
+    /// Accepted and ignored: `{"debug": true}` listed a tool that is gone.
+    #[allow(dead_code)]
+    mcp: Option<Value>,
 }
 
 /// The built-in extensions: launch data only, never pins (those live in a lock). A built-in is on
@@ -474,7 +442,7 @@ pub fn parse_ext(text: &str, from: &str) -> Result<Extension> {
         for t in ext.servers.iter().flat_map(|s| s.command.iter().chain(s.env.values())) {
             render(t, &mut |_| Some(String::new()))?;
         }
-        for v in ext.servers.iter().flat_map(|s| [&s.init_options, &s.settings]).chain(ext.debug.iter().flat_map(|d| [&d.arguments, &d.attach])) {
+        for v in ext.servers.iter().flat_map(|s| [&s.init_options, &s.settings]) {
             render_value(v, &mut |_| Some(String::new()))?;
         }
         crate::parse::check(&ext)
@@ -678,7 +646,7 @@ pub fn ext(ws: &Workspace, dirs: &Dirs, cwd: &Path, args: &Args, actor: &str) ->
                 list("detect", e.detect.clone()),
                 list("requires", e.requires.clone()),
                 list("packages", packages),
-                list("servers", e.servers.iter().map(|s| s.id.clone()).collect()),
+                list("servers", e.servers.iter().map(|s| s.protocol.retired().map_or(s.id.clone(), |p| format!("{} ({p}, no longer hosted)", s.id))).collect()),
                 list("actions", e.actions.iter().map(|a| a.label.clone()).collect()),
                 list("problemMatchers", e.problem_matchers.keys().cloned().collect()),
                 list("ignored", ignored),
@@ -700,7 +668,7 @@ pub fn ext(ws: &Workspace, dirs: &Dirs, cwd: &Path, args: &Args, actor: &str) ->
             ensure!(lock::record_removed(dirs, &arg)? | fs::remove_file(&path).is_ok(), "no added extension '{arg}'; built-ins can't be removed");
             vec![format!("removed {arg} by {actor}")]
         }
-        other => bail!("unexpected argument '{other}'; 'ext' takes list, show, tools, add or remove"),
+        other => bail!("unexpected argument '{other}'; 'ext' takes list, show, add or remove"),
     };
     let scope = [args.target.as_deref().unwrap_or("list"), &arg].join(" ").trim_end().to_string();
     Ok(Outcome { notes, ..Outcome::new("ext", Verdict::Ok, scope, "") })

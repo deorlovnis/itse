@@ -19,7 +19,7 @@ fn the_skill_is_short_has_front_matter_and_lists_every_tool_verb() {
 fn the_skill_holds_no_imperatives() {
     // The same rule as the result templates': the skill states facts and leaves the choice to the agent.
     let imperative = Regex::new(r"(?i)please|you should|you must|make sure|don't|do not|always|never").unwrap();
-    let text = skill("itse", "Workspace facts from itse: tests, problems, symbols by name, debug snapshots");
+    let text = skill("itse", "Workspace facts from itse: tests, problems, symbols by name");
     assert!(!imperative.is_match(&text), "{:?}", imperative.find(&text));
 }
 
@@ -98,4 +98,23 @@ fn the_config_env_moves_the_declared_paths_into_its_folder() {
     assert_eq!((place("~/.claude", Some(&moved)), place("~/.claude.json", Some(&moved))), ("/cfg".into(), "/cfg/.claude.json".into()));
     assert_eq!(place("~/.claudex/a", Some(&moved)), "~/.claudex/a", "a prefix of a name is no match");
     assert_eq!(place("~/.claude/settings.json", None), "~/.claude/settings.json");
+}
+
+#[test]
+fn a_skill_an_older_itse_wrote_is_noted_until_it_is_written_again() {
+    let tmp = TempDir::new("itse-skill");
+    let vars: BTreeMap<&str, std::ffi::OsString> = [("HOME", tmp.0.join("home").into_os_string())].into();
+    let dirs = Dirs::from_env(|k| vars.get(k).cloned()).unwrap();
+    let exts = manifest::extensions(&dirs).unwrap().0;
+    let (path, spec) = (tmp.0.join("SKILL.md"), serde_json::from_value::<Integration>(exts["claude-code"].0.integration.clone().unwrap()).unwrap().skill.unwrap());
+    let stale = |text: &str, recorded: &str| {
+        fs::write(&path, text).unwrap();
+        record(&dirs, &format!("claude-code skill {}", path.display()), Some(json!({"sha256": sys::sha256_hex(recorded.as_bytes())}))).unwrap();
+        stale_skills(&dirs, &exts)
+    };
+    let old = "---\nname: itse\n---\n- `itse debug test`: debug the tests\n";
+    assert_eq!(stale(old, old), [format!("skill: {} is an older itse's; 'itse integrate claude-code --skill --yes' updates it", path.display())]);
+    assert_eq!(stale(old, "edited since"), Vec::<String>::new(), "a skill changed since it was written is left alone");
+    let now = skill(&spec.name, &spec.description);
+    assert_eq!(stale(&now, &now), Vec::<String>::new());
 }

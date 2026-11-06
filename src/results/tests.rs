@@ -91,7 +91,7 @@ fn printed_pointers_are_fully_qualified() {
     let mut o = many(41);
     o.items[3].detail.extend((0..10).map(|i| format!("at frame {i}")));
     let pointer = Regex::new(r"itse show (\S+)").unwrap();
-    let qualified = Regex::new(r"^(q|run|dbg):\d+(/[A-Z]\d+)?$").unwrap();
+    let qualified = Regex::new(r"^(q|run):\d+(/[A-Z]\d+)?$").unwrap();
     let mut found = 0;
     for page in pages(&mut o, "cli").iter().chain(pages(&mut o, "mcp").iter()) {
         for c in pointer.captures_iter(page) {

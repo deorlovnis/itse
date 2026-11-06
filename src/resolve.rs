@@ -19,7 +19,7 @@ use serde_json::{Value, json};
 
 use crate::host::{Launch, Protocol};
 use crate::lock::{self, Consent, Lock};
-use crate::manifest::{DapVia, Manifest, Package, SystemCheck, Use, render, render_value};
+use crate::manifest::{Manifest, Package, Server, SystemCheck, Use, render, render_value};
 use crate::results::{Outcome, State};
 use crate::sys;
 use crate::verbs::Args;
@@ -77,25 +77,33 @@ pub fn resolve(ws: &Workspace, dirs: &Dirs, env: &BTreeMap<String, String>, now:
 pub fn resolve_for(ws: &Workspace, dirs: &Dirs, env: &BTreeMap<String, String>, now: SystemTime, checks: bool) -> Result<Resolved> {
     let m = Manifest::load(ws, dirs)?;
     let uses = m.uses();
-    let mut code = Vec::new();
-    for ext in uses.iter().filter_map(|u| m.exts.get(&u.id)).map(|e| &e.0) {
-        // A debug adapter runs the project's code: it launches the tests (as `via` and the debug
-        // block say), or evaluates in them.
-        for s in ext.servers.iter().filter(|s| s.executes_project_code || s.protocol == Protocol::Dap || m.packages_of(s, &uses).any(|p| p.executes_project_code)) {
-            let mut c = json!({"server": s.id, "command": s.command, "env": s.env});
-            // What runs only: the stop rule's fields don't.
-            s.via.as_ref().inspect(|via| c["via"] = json!(via));
-            ext.debug.as_ref().filter(|d| d.adapter == s.id).inspect(|d| c["debug"] = json!({"request": d.request, "arguments": d.arguments, "attach": d.attach}));
-            code.push((s.id.clone(), c));
+    // `legacy` is what an itse that still hosted debug adapters and MCP servers hashed: their
+    // entries too. Trust given to that is trust in all that runs now, so an upgrade keeps it.
+    let (mut code, mut legacy) = (Vec::new(), Vec::new());
+    for (ext, from) in uses.iter().filter_map(|u| m.exts.get(&u.id)) {
+        for s in &ext.servers {
+            let runs = s.executes_project_code || m.packages_of(s, &uses).any(|p| p.executes_project_code);
+            // A server of a retired protocol never starts, so it runs nothing.
+            if runs && s.protocol == Protocol::Lsp {
+                code.push((s.id.clone(), json!({"server": s.id, "command": s.command, "env": s.env})));
+            }
+            if runs || s.protocol == Protocol::Dap {
+                legacy.push(legacy_entry(s, ext.debug.as_ref()));
+            }
         }
+        let retired = RETIRED.iter().filter(|r| *from == "built-in" && r.0 == ext.id && !ext.servers.iter().any(|s| s.id == r.1));
+        legacy.extend(retired.filter_map(|r| serde_json::from_str::<Value>(r.2).ok()));
         for a in ext.actions.iter().filter(|a| a.executes_project_code) {
-            code.push((a.label.clone(), json!({"action": a.label, "command": a.command, "args": a.args, "cwd": a.options.cwd, "env": a.options.env})));
+            let entry = json!({"action": a.label, "command": a.command, "args": a.args, "cwd": a.options.cwd, "env": a.options.env});
+            legacy.push(entry.clone());
+            code.push((a.label.clone(), entry));
         }
     }
     // A team lock is a team-layer file too: its pins would choose what runs, so it asks for trust.
     let (team, trust_hash) = (!m.team_bytes.is_empty(), lock::trust_hash(&m.team_bytes, &code.iter().map(|c| c.1.clone()).collect::<Vec<_>>()));
     let needs_trust = team || !code.is_empty();
-    let trusted = !needs_trust || lock::trusted(dirs, ws, &trust_hash)?;
+    let old_hash = lock::trust_hash(&m.team_bytes, &legacy);
+    let trusted = !needs_trust || lock::trusted(dirs, ws, &trust_hash)? || (old_hash != trust_hash && lock::trusted(dirs, ws, &old_hash)?);
     let (lock, waiting) = Lock::load(dirs, ws, trusted)?;
     let day = |d: u64| sys::utc(now + Duration::from_secs(d * 86_400))[..10].to_string();
     let cx = Cx { ws, dirs, path: env.get("PATH"), lock, waiting, consents: lock::consents(dirs)?, today: day(0), soon: day(7) };
@@ -157,7 +165,33 @@ pub fn resolve_for(ws: &Workspace, dirs: &Dirs, env: &BTreeMap<String, String>, 
         None => "layer: none; 'itse use <ext>' declares one".into(),
     });
     notes.extend(m.team.iter().map(|_| "team layer: .itse/itse.json, read-only".to_string()));
+    let servers = uses.iter().filter_map(|u| m.exts.get(&u.id)).flat_map(|e| &e.0.servers);
+    notes.extend(servers.filter_map(|s| Some(format!("{}: protocol {} is no longer hosted; ignored", s.id, s.protocol.retired()?))));
     Ok(Resolved { manifest: m, states, launches, notes, trust_hash, trusted, held, roots })
+}
+
+/// The debug adapters the built-ins no longer declare, as an older itse put them in the trust hash:
+/// extension, server and entry, after the extension's other servers.
+const RETIRED: &[(&str, &str, &str)] = &[(
+    "kotlin",
+    "kotlin-dap",
+    r#"{"server": "kotlin-dap", "command": [], "env": {}, "via": {"lsp_command": {"server": "kotlin-lsp", "command": "start_debug_server", "arguments": []}}}"#,
+)];
+
+/// A server's trust-hash entry as an older itse made it: with a debug adapter's `via` (whose
+/// `lsp_command` always had `arguments`) and the request of the extension's debug block.
+fn legacy_entry(s: &Server, debug: Option<&Value>) -> Value {
+    let mut c = json!({"server": s.id, "command": s.command, "env": s.env});
+    if let Some(via) = &s.via {
+        c["via"] = via.clone();
+        if let Some(l) = c["via"].get_mut("lsp_command").and_then(Value::as_object_mut) {
+            l.entry("arguments").or_insert(json!([]));
+        }
+    }
+    if let Some(d) = debug.filter(|d| d["adapter"] == s.id.as_str()) {
+        c["debug"] = json!({"request": d["request"], "arguments": d["arguments"], "attach": d["attach"]});
+    }
+    c
 }
 
 /// One package's row, and its root when it is present.
@@ -208,7 +242,7 @@ fn launches(cx: &Cx, m: &Manifest, uses: &[Use], roots: &BTreeMap<String, PathBu
     let mut out = Vec::new();
     for u in uses {
         for s in m.exts.get(&u.id).into_iter().flat_map(|e| &e.0.servers) {
-            if held.contains(&s.id) {
+            if held.contains(&s.id) || s.protocol != Protocol::Lsp {
                 continue;
             }
             let mut fill = |key: &str| match key.split_once(':') {
@@ -224,15 +258,9 @@ fn launches(cx: &Cx, m: &Manifest, uses: &[Use], roots: &BTreeMap<String, PathBu
             };
             let argv: Result<Vec<String>> = s.command.iter().map(|t| render(t, &mut fill)).collect();
             let env: Result<Vec<(String, String)>> = s.env.iter().map(|(k, v)| Ok((k.clone(), render(v, &mut fill)?))).collect();
-            let via = match &s.via {
-                Some(DapVia::Tcp { argv, port }) => argv.iter().map(|t| render(t, &mut fill)).collect::<Result<_>>().map(|argv| Some(DapVia::Tcp { argv, port: *port })),
-                via => Ok(via.clone()),
-            };
-            let (Ok(argv), Ok(env), Ok(via)) = (argv, env, via) else { continue };
+            let (Ok(argv), Ok(env)) = (argv, env) else { continue };
             // Before trust the team layer is read for status only, so its server settings wait too.
             let set = settings.get(&s.id).filter(|x| trusted || !x.1).map(|x| x.0);
-            // Exposing a server's tools is the developer's choice alone, never the team layer's.
-            let exposed = settings.get(&s.id).filter(|x| !x.1 && x.0.expose).map(|x| x.0);
             let lsp_settings = set.and_then(|x| x.settings.as_ref()).unwrap_or(&s.settings);
             let (Ok(settings), Ok(init_options)) = (render_value(lsp_settings, &mut fill), render_value(&s.init_options, &mut fill)) else { continue };
             // Without init_options a server gets its own section of the settings, so a manifest says them once.
@@ -240,7 +268,6 @@ fn launches(cx: &Cx, m: &Manifest, uses: &[Use], roots: &BTreeMap<String, PathBu
             let exit_codes = m.packages_of(s, uses).flat_map(|p| &p.exit_codes).filter_map(|(k, v)| Some((k.parse().ok()?, v.clone()))).collect();
             out.push(Launch {
                 id: s.id.clone(),
-                protocol: s.protocol,
                 argv,
                 cwd: ws.root.clone(),
                 env,
@@ -252,11 +279,6 @@ fn launches(cx: &Cx, m: &Manifest, uses: &[Use], roots: &BTreeMap<String, PathBu
                 filetypes: s.filetypes.clone(),
                 outputs: s.outputs.clone(),
                 idle_minutes: set.and_then(|x| x.idle_minutes).or(s.idle_minutes),
-                timeout_s: s.timeout_s,
-                expose: exposed.is_some(),
-                tools: exposed.and_then(|x| x.tools.clone()),
-                max_list_bytes: exposed.and_then(|x| x.max_list_bytes),
-                via,
             });
         }
     }

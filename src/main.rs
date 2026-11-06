@@ -10,7 +10,6 @@
 
 mod actions;
 mod daemon;
-mod dap;
 mod env;
 mod host;
 mod lock;

@@ -77,7 +77,7 @@ fn initialize_echoes_supported_and_answers_newest_otherwise() {
     for (asked, answered) in [("2025-06-18", "2025-06-18"), ("2025-11-25", "2025-11-25"), ("2025-03-26", "2025-11-25"), ("junk", "2025-11-25")] {
         let init = Session::new(&host, &[]).init(asked);
         assert_eq!(init["protocolVersion"], answered, "{asked}");
-        assert_eq!(init["capabilities"], json!({"tools": {"listChanged": true}}));
+        assert_eq!(init["capabilities"], json!({"tools": {}}), "the tool list never changes");
         assert_eq!(init["serverInfo"], json!({"name": "itse", "version": VERSION}));
         assert_eq!(init["instructions"], text("instructions", &[]));
     }
@@ -115,47 +115,41 @@ fn a_tool_failure_is_isError_not_an_rpc_error() {
 #[test]
 fn tool_list_with_instructions_stays_under_3600_bytes() {
     let tmp = TempDir::new("itse-mcp");
-    let mut s = Session::new(&host(&tmp, Some(r#"{"mcp": {"debug": true}}"#)), &[]);
+    let mut s = Session::new(&host(&tmp, None), &[]);
     let instructions = s.init("2025-11-25")["instructions"].as_str().unwrap().len();
     let list = s.rpc("tools/list", json!({}))["result"].to_string();
-    assert_eq!(list.len() + instructions, list_bytes(true));
-    assert!(list_bytes(true) <= LIST_CAP, "{} bytes with debug on", list_bytes(true));
-    eprintln!("tool list: {} B (debug off), {} B (debug on), of {LIST_CAP}", list_bytes(false), list_bytes(true));
+    assert_eq!(list.len() + instructions, list_bytes());
+    assert!(list_bytes() <= LIST_CAP, "{} bytes", list_bytes());
+    eprintln!("tool list: {} B of {LIST_CAP}", list_bytes());
 }
 
 #[test]
-fn debug_tool_absent_unless_opted_in() {
+fn each_tool_takes_its_enum_and_an_old_debug_opt_in_adds_nothing() {
     let tmp = TempDir::new("itse-mcp");
-    let names = |s: &mut Session| s.rpc("tools/list", json!({}))["result"]["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap().to_string()).collect::<Vec<_>>();
-    let mut off = Session::new(&host(&tmp, None), &[]);
-    assert_eq!(names(&mut off), ["test_build_run", "problems_symbols", "show_result"]);
-    assert_eq!(off.call("debug", json!({"verb": "test", "target": ":data"})), (true, "ERROR debug — no such tool\n".into()));
-    assert_eq!(off.call("test_build_run", json!({"verb": "debug", "args": ["test"]})), (true, "ERROR debug — not a verb of test_build_run\n".into()));
-    assert_eq!(off.call("test_build_run", json!({"verb": "status"})), (true, "ERROR status — not a verb of test_build_run\n".into()), "each tool takes its enum");
-    let other = TempDir::new("itse-mcp");
-    let mut on = Session::new(&host(&other, Some(r#"{"mcp": {"debug": true}}"#)), &[]);
-    assert_eq!(names(&mut on), ["test_build_run", "problems_symbols", "show_result", "debug"]);
-    let none = "ERROR debug test :data — no extension in use declares how its tests run under a debugger (debug.adapter)\n";
-    assert_eq!(on.call("debug", json!({"verb": "test", "target": ":data"})), (true, none.into()), "the tool reaches the verb");
+    let mut s = Session::new(&host(&tmp, Some(r#"{"mcp": {"debug": true}}"#)), &[]);
+    let names: Vec<String> = s.rpc("tools/list", json!({}))["result"]["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap().to_string()).collect();
+    assert_eq!(names, ["test_build_run", "problems_symbols", "show_result"]);
+    assert_eq!(s.call("debug", json!({"verb": "test", "target": ":data"})), (true, "ERROR debug — no such tool\n".into()));
+    assert_eq!(s.call("fixture__echo", json!({})), (true, "ERROR fixture__echo — no such tool\n".into()));
+    assert_eq!(s.call("test_build_run", json!({"verb": "status"})), (true, "ERROR status — not a verb of test_build_run\n".into()), "each tool takes its enum");
 }
 
 #[test]
 fn every_cli_flag_is_reachable_over_mcp() {
     let tmp = TempDir::new("itse-mcp");
-    let mut s = Session::new(&host(&tmp, Some(r#"{"mcp": {"debug": true}}"#)), &[]);
+    let mut s = Session::new(&host(&tmp, None), &[]);
     let list = s.rpc("tools/list", json!({}))["result"]["tools"].clone();
     let mut checked = 0;
     for v in VERBS.iter().filter(|v| v.tool != Tool::CliOnly && !v.human_only) {
         let tool = tool_name(v.tool);
         let schema = &list.as_array().unwrap().iter().find(|t| t["name"] == tool).unwrap()["inputSchema"]["properties"];
-        assert!(v.tool == Tool::Show || v.tool == Tool::Debug || schema["verb"]["enum"].as_array().unwrap().contains(&json!(v.name)), "{} is in {tool}'s enum", v.name);
+        assert!(v.tool == Tool::Show || schema["verb"]["enum"].as_array().unwrap().contains(&json!(v.name)), "{} is in {tool}'s enum", v.name);
         for p in v.params {
             let (Param::Flag(name) | Param::Opt(name) | Param::Many(name)) = *p else { continue };
             let value = if matches!(p, Param::Flag(_)) { None } else { Some(if name == "page" || name == "tail" { "2" } else { "x" }) };
             let tokens: Vec<String> = [format!("--{name}")].into_iter().chain(value.map(String::from)).collect();
             let args = match v.tool {
                 Tool::Show => json!({"id": "q:1", (name): value.map_or(json!(true), |v| json!(v))}),
-                Tool::Debug => json!({"verb": "test", "args": tokens}),
                 _ => json!({"verb": v.name, "args": tokens}),
             };
             assert!(schema.get(name).is_some() || v.tool != Tool::Show, "show_result takes {name}");
@@ -164,7 +158,7 @@ fn every_cli_flag_is_reachable_over_mcp() {
             checked += 1;
         }
     }
-    assert!(checked >= 15, "{checked} flags checked");
+    assert!(checked >= 14, "{checked} flags checked");
 }
 
 #[test]
@@ -208,7 +202,7 @@ fn human_only_verbs_return_needs_human_over_mcp_and_record_nothing() {
 #[test]
 fn integrate_is_not_reachable_over_mcp() {
     let tmp = TempDir::new("itse-mcp");
-    let mut s = Session::new(&host(&tmp, Some(r#"{"mcp": {"debug": true}}"#)), &[]);
+    let mut s = Session::new(&host(&tmp, None), &[]);
     let list = s.rpc("tools/list", json!({}))["result"].to_string();
     assert!(!list.contains("integrate"), "no tool offers it");
     for tool in ["test_build_run", "problems_symbols"] {

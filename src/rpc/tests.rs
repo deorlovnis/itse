@@ -94,14 +94,6 @@ fn an_oversized_frame_becomes_a_failed_response_to_its_id_in_both_framings() {
     }
 }
 
-#[test]
-fn a_dap_frame_names_its_request_seq_when_oversized() {
-    let big = format!("{{\"seq\":9,\"type\":\"response\",\"request_seq\":4,\"body\":{{\"id\":1,\"x\":\"{}\"}}}}", "y".repeat(100));
-    let text = format!("Content-Length: {}\r\n\r\n{big}", big.len());
-    let got = read_all(text.as_bytes(), Framing::Headers, 64);
-    assert_eq!((&ok(&got[0])["request_seq"], &ok(&got[0])["success"]), (&json!(4), &json!(false)));
-}
-
 /// What a peer's Handler saw.
 #[derive(Default)]
 struct Rec {
@@ -175,9 +167,9 @@ impl Server {
     }
 }
 
-fn pair(f: Framing, d: Dialect, h: Arc<Rec>) -> (Arc<Peer>, Server) {
+fn pair(f: Framing, h: Arc<Rec>) -> (Arc<Peer>, Server) {
     let (a, b) = UnixStream::pair().unwrap();
-    let peer = Peer::start(BufReader::new(a.try_clone().unwrap()), a, f, d, h);
+    let peer = Peer::start(BufReader::new(a.try_clone().unwrap()), a, f, h);
     (peer, Server { r: BufReader::new(b.try_clone().unwrap()), w: b, f })
 }
 
@@ -191,7 +183,7 @@ fn spawn_request(peer: &Arc<Peer>, method: &'static str, timeout: Duration, canc
 
 #[test]
 fn out_of_order_responses_reach_their_requests() {
-    let (peer, mut srv) = pair(Framing::Headers, Dialect::Lsp, Arc::default());
+    let (peer, mut srv) = pair(Framing::Headers, Arc::default());
     let a = spawn_request(&peer, "a", LONG, Cancel::default());
     let ida = srv.recv()["id"].clone();
     let b = spawn_request(&peer, "b", LONG, Cancel::default());
@@ -199,12 +191,12 @@ fn out_of_order_responses_reach_their_requests() {
     srv.send(json!({"jsonrpc": "2.0", "id": idb, "result": "for b"}));
     srv.send(json!({"jsonrpc": "2.0", "id": ida, "error": {"code": -32800, "message": "gone", "data": 1}}));
     assert_eq!(b.join().unwrap().unwrap(), "for b");
-    assert!(matches!(a.join().unwrap(), Err(RpcError::Remote { code: -32800, message, data: Some(_) }) if message == "gone"));
+    assert!(matches!(a.join().unwrap(), Err(RpcError::Remote { code: -32800, message }) if message == "gone"));
 }
 
 #[test]
 fn an_oversized_body_is_drained_and_the_peer_stays_usable() {
-    let (peer, mut srv) = pair(Framing::Headers, Dialect::Lsp, Arc::default());
+    let (peer, mut srv) = pair(Framing::Headers, Arc::default());
     let a = spawn_request(&peer, "a", LONG, Cancel::default());
     let id = srv.recv()["id"].clone();
     srv.send(json!({"jsonrpc": "2.0", "id": id, "result": "x".repeat(MAX_FRAME + 10)}));
@@ -218,32 +210,30 @@ fn an_oversized_body_is_drained_and_the_peer_stays_usable() {
 #[test]
 fn non_json_lines_from_a_child_are_skipped_and_logged() {
     let rec = Arc::new(Rec::default());
-    let (peer, mut srv) = pair(Framing::Lines, Dialect::Mcp, rec.clone());
-    let a = spawn_request(&peer, "tools/list", LONG, Cancel::default());
+    let (peer, mut srv) = pair(Framing::Lines, rec.clone());
+    let a = spawn_request(&peer, "workspace/symbol", LONG, Cancel::default());
     let id = srv.recv()["id"].clone();
     srv.send_raw("Starting server on stdout...");
-    srv.send(json!({"jsonrpc": "2.0", "id": id, "result": {"tools": []}}));
-    assert_eq!(a.join().unwrap().unwrap(), json!({"tools": []}));
+    srv.send(json!({"jsonrpc": "2.0", "id": id, "result": []}));
+    assert_eq!(a.join().unwrap().unwrap(), json!([]));
     assert_eq!(lock(&rec.skipped).len(), 1);
 }
 
 #[test]
 fn json_lines_that_are_no_object_are_skipped_and_the_peer_stays_usable() {
-    for d in [Dialect::Mcp, Dialect::Dap] {
-        let rec = Arc::new(Rec::default());
-        let (peer, mut srv) = pair(Framing::Lines, d, rec.clone());
-        let a = spawn_request(&peer, "x", LONG, Cancel::default());
-        let req = srv.recv();
-        ["1", "\"x\"", "[\"x\"]", "null"].into_iter().for_each(|line| srv.send_raw(line));
-        srv.send(json!({"jsonrpc": "2.0", "id": req["id"], "result": 2, "type": "response", "request_seq": req["seq"], "success": true, "body": 2}));
-        assert_eq!(a.join().unwrap().unwrap(), 2, "{d:?}");
-        assert_eq!((lock(&rec.skipped).len(), lock(&rec.closed).clone()), (4, None), "{d:?}");
-    }
+    let rec = Arc::new(Rec::default());
+    let (peer, mut srv) = pair(Framing::Lines, rec.clone());
+    let a = spawn_request(&peer, "x", LONG, Cancel::default());
+    let req = srv.recv();
+    ["1", "\"x\"", "[\"x\"]", "null"].into_iter().for_each(|line| srv.send_raw(line));
+    srv.send(json!({"jsonrpc": "2.0", "id": req["id"], "result": 2}));
+    assert_eq!(a.join().unwrap().unwrap(), 2);
+    assert_eq!((lock(&rec.skipped).len(), lock(&rec.closed).clone()), (4, None));
 }
 
 #[test]
 fn a_timeout_sends_cancel_request() {
-    let (peer, mut srv) = pair(Framing::Headers, Dialect::Lsp, Arc::default());
+    let (peer, mut srv) = pair(Framing::Headers, Arc::default());
     let started = Instant::now();
     let a = spawn_request(&peer, "slow", Duration::from_millis(200), Cancel::default());
     let id = srv.recv()["id"].clone();
@@ -253,20 +243,20 @@ fn a_timeout_sends_cancel_request() {
 }
 
 #[test]
-fn a_cancel_sends_the_dialects_cancel() {
-    let (peer, mut srv) = pair(Framing::Lines, Dialect::Mcp, Arc::default());
+fn a_cancel_sends_cancel_request() {
+    let (peer, mut srv) = pair(Framing::Headers, Arc::default());
     let cancel = Cancel::default();
-    let a = spawn_request(&peer, "tools/call", LONG, cancel.clone());
+    let a = spawn_request(&peer, "workspace/symbol", LONG, cancel.clone());
     let id = srv.recv()["id"].clone();
     cancel.cancel();
     assert!(matches!(a.join().unwrap(), Err(RpcError::Cancelled)));
-    assert_eq!(srv.recv(), json!({"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {"requestId": id, "reason": "cancelled"}}));
+    assert_eq!(srv.recv(), json!({"jsonrpc": "2.0", "method": "$/cancelRequest", "params": {"id": id}}));
 }
 
 #[test]
 fn a_server_request_is_answered_while_a_client_request_waits() {
     let rec = Arc::new(Rec::default());
-    let (peer, mut srv) = pair(Framing::Headers, Dialect::Lsp, rec.clone());
+    let (peer, mut srv) = pair(Framing::Headers, rec.clone());
     let a = spawn_request(&peer, "initialize", LONG, Cancel::default());
     let id = srv.recv()["id"].clone();
     srv.send(json!({"jsonrpc": "2.0", "id": "s1", "method": "workspace/configuration", "params": {"items": []}}));
@@ -282,7 +272,7 @@ fn a_server_request_is_answered_while_a_client_request_waits() {
 #[test]
 fn eof_fails_pending_requests_and_later_ones() {
     let rec = Arc::new(Rec::default());
-    let (peer, mut srv) = pair(Framing::Headers, Dialect::Lsp, rec.clone());
+    let (peer, mut srv) = pair(Framing::Headers, rec.clone());
     let a = spawn_request(&peer, "a", LONG, Cancel::default());
     srv.recv();
     drop(srv);
@@ -293,7 +283,7 @@ fn eof_fails_pending_requests_and_later_ones() {
 
 #[test]
 fn a_reply_that_came_just_before_the_close_is_taken_not_dropped() {
-    let (peer, mut srv) = pair(Framing::Headers, Dialect::Lsp, Arc::default());
+    let (peer, mut srv) = pair(Framing::Headers, Arc::default());
     let a = spawn_request(&peer, "a", LONG, Cancel::default());
     let id = srv.recv()["id"].as_i64().unwrap();
     // Held across the end of a 100 ms step, the caller waits on the state there. Meanwhile the
@@ -309,7 +299,7 @@ fn a_reply_that_came_just_before_the_close_is_taken_not_dropped() {
 #[test]
 fn a_panicking_handler_marks_the_peer_crashed() {
     let rec = Arc::new(Rec { panics: true, ..Rec::default() });
-    let (peer, mut srv) = pair(Framing::Lines, Dialect::Lsp, rec.clone());
+    let (peer, mut srv) = pair(Framing::Lines, rec.clone());
     let a = spawn_request(&peer, "a", LONG, Cancel::default());
     srv.recv();
     srv.send(json!({"jsonrpc": "2.0", "method": "boom"}));
@@ -319,39 +309,8 @@ fn a_panicking_handler_marks_the_peer_crashed() {
 }
 
 #[test]
-fn dap_matches_request_seq_and_turns_success_false_into_remote() {
-    let rec = Arc::new(Rec::default());
-    let (peer, mut srv) = pair(Framing::Headers, Dialect::Dap, rec.clone());
-    let a = spawn_request(&peer, "launch", LONG, Cancel::default());
-    let req = srv.recv();
-    assert_eq!((req["type"].as_str(), req["command"].as_str()), (Some("request"), Some("launch")));
-    srv.send(json!({"seq": 1, "type": "event", "event": "initialized"}));
-    srv.send(json!({"seq": 2, "type": "request", "command": "runInTerminal", "arguments": {}}));
-    let refused = srv.recv();
-    assert_eq!((refused["request_seq"].as_i64(), refused["success"].as_bool()), (Some(2), Some(false)));
-    srv.send(json!({"seq": 3, "type": "response", "request_seq": req["seq"], "success": false, "message": "no program"}));
-    assert!(matches!(a.join().unwrap(), Err(RpcError::Remote { message, .. }) if message == "no program"));
-    assert_eq!(lock(&rec.notes)[0].0, "initialized");
-    let b = spawn_request(&peer, "threads", LONG, Cancel::default());
-    let seq = srv.recv()["seq"].clone();
-    srv.send(json!({"seq": 4, "type": "response", "request_seq": seq, "success": true, "body": {"threads": []}}));
-    assert_eq!(b.join().unwrap().unwrap(), json!({"threads": []}));
-}
-
-#[test]
-fn dap_cancels_only_when_the_adapter_supports_it() {
-    let (peer, mut srv) = pair(Framing::Headers, Dialect::Dap, Arc::default());
-    peer.dap_cancel.store(true, Ordering::SeqCst);
-    let a = spawn_request(&peer, "evaluate", Duration::from_millis(100), Cancel::default());
-    let seq = srv.recv()["seq"].clone();
-    assert!(matches!(a.join().unwrap(), Err(RpcError::Timeout)));
-    let cancel = srv.recv();
-    assert_eq!((cancel["command"].as_str(), &cancel["arguments"]), (Some("cancel"), &json!({"requestId": seq})));
-}
-
-#[test]
 fn a_peer_that_stops_reading_blocks_no_caller() {
-    let (peer, srv) = pair(Framing::Headers, Dialect::Lsp, Arc::default());
+    let (peer, srv) = pair(Framing::Headers, Arc::default());
     // Far more than the socket buffer holds, and nobody reads it.
     peer.notify("textDocument/didChange", json!({"text": "x".repeat(8 << 20)})).unwrap();
     let started = Instant::now();

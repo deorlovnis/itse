@@ -3,11 +3,9 @@
 //!
 //! It speaks JSON with serde_json directly, not through Itse's modules, so Itse's codecs are never
 //! tested against themselves. `ITSE_FIXTURE_MODE` drives the error paths (`exit:<n>`, `slow`,
-//! `crash-after-init`). It has `lsp`, `dap`, `mcp` and `tool` modes.
+//! `crash-after-init`). It has `lsp` and `tool` modes.
 
-mod dap;
 mod lsp;
-mod mcp;
 mod tool;
 
 use std::env;
@@ -25,11 +23,9 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Some("lsp") => lsp::serve(&mode),
-        Some("dap") => dap::serve(&args[1..], &mode),
-        Some("mcp") => mcp::serve(&mode),
         Some("tool") => tool::run(&args[1..], &mode),
         other => {
-            eprintln!("itse-fixture: unknown mode '{}' (lsp, dap, mcp and tool)", other.unwrap_or(""));
+            eprintln!("itse-fixture: unknown mode '{}' (lsp and tool)", other.unwrap_or(""));
             ExitCode::from(2)
         }
     }

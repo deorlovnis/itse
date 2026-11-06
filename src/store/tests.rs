@@ -346,6 +346,18 @@ fn gc_removes_read_only_packages_no_lock_pins() {
 }
 
 #[test]
+fn gc_removes_the_debug_snapshots_of_an_older_itse_and_keeps_results() {
+    let fx = Fx::new();
+    let ws = fx.dirs.state.join("ws/0123456789ab");
+    for dir in ["debug/1", "results"] {
+        fs::create_dir_all(ws.join(dir)).unwrap();
+        fs::write(ws.join(dir).join("1.json"), b"{}").unwrap();
+    }
+    assert_eq!(gc(&fx.dirs).unwrap(), ["0123456789ab/debug"]);
+    assert!(!ws.join("debug").exists() && ws.join("results/1.json").exists());
+}
+
+#[test]
 fn gc_removes_nothing_while_a_lock_cannot_be_read() {
     let fx = Fx::new();
     let a = gz("#!/bin/sh\na\n");

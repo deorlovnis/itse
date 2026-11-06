@@ -3,21 +3,15 @@
 //! on a connection whose `hello` said `mode: "mcp"` (Halti's mcp.rs loop).
 //!
 //! Three tools carry every verb an agent runs, with the CLI's own tokens in `args`, parsed by the
-//! same function, so the skill, the index and MCP share one vocabulary; `debug` is listed only on
-//! opt-in (`"mcp": {"debug": true}`). Claude Code defers schemas behind tool search, so the tool
-//! names and `instructions` carry the keywords an agent searches for. The tools of hosted MCP
-//! servers the developer exposes follow them (`client`).
+//! same function, so the skill, the index and MCP share one vocabulary. Claude Code defers schemas
+//! behind tool search, so the tool names and `instructions` carry the keywords an agent searches for.
 
-pub mod client;
 pub mod relay;
 
 use std::collections::HashMap;
 use std::io::{BufRead, ErrorKind, Write};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
 
 use serde_json::{Value, json};
 
@@ -33,14 +27,12 @@ use crate::verbs::{self, Caller, Tool, VERBS};
 pub const SUPPORTED: [&str; 2] = ["2025-11-25", "2025-06-18"];
 /// The whole list, `instructions` included, stays under this many bytes.
 pub const LIST_CAP: usize = 3600;
-const DEBUG_VERBS: [&str; 7] = ["test", "attach", "step", "continue", "eval", "snapshot", "stop"];
 
 pub fn tool_name(t: Tool) -> &'static str {
     match t {
         Tool::Run => "test_build_run",
         Tool::Query => "problems_symbols",
         Tool::Show => "show_result",
-        Tool::Debug => "debug",
         Tool::CliOnly => "",
     }
 }
@@ -75,8 +67,8 @@ pub fn offered() -> Vec<&'static str> {
     VERBS.iter().filter(|v| matches!(v.tool, Tool::Run | Tool::Query | Tool::Show)).map(|v| v.name).collect()
 }
 
-/// The tool list: three tools, and `debug` when opted in. Each verb enum comes from the verb table.
-pub fn tools(debug: bool) -> Vec<Value> {
+/// The tool list: three tools. Each verb enum comes from the verb table.
+pub fn tools() -> Vec<Value> {
     let of = |t: Tool| VERBS.iter().filter(|v| v.tool == t).map(|v| v.name).collect::<Vec<_>>();
     let schema = |verbs: Vec<&str>, extra: Value| {
         let mut props = json!({"verb": {"type": "string", "enum": verbs}, "target": {"type": "string"}, "args": {"type": "array", "items": {"type": "string"}}});
@@ -86,24 +78,19 @@ pub fn tools(debug: bool) -> Vec<Value> {
         json!({"type": "object", "properties": props, "required": ["verb"]})
     };
     let int = json!({"type": "integer"});
-    let mut tools = vec![
+    vec![
         json!({"name": "test_build_run", "description": "Run tests, builds and declared actions; install, lock, use. args takes the CLI's tokens: [\"--action\", \"cargo:test\"]. Long runs return run:N for show_result.",
             "inputSchema": schema(of(Tool::Run), json!({"wait": int}))}),
         json!({"name": "problems_symbols", "description": "Problems (compile errors, diagnostics), symbols by name (find, refs, info, outline), status. args takes the CLI's tokens: [\"--new\"], [\"--kind\", \"method\"].",
             "inputSchema": schema(of(Tool::Query), json!({"page": int}))}),
         json!({"name": "show_result", "description": "Show a stored result or log by id (run:14, run:14/T1, q:7): pages, grep, tail.",
             "inputSchema": {"type": "object", "properties": {"id": {"type": "string"}, "page": int, "grep": {"type": "string"}, "tail": int, "json": {"type": "boolean"}, "raw": {"type": "boolean"}}, "required": ["id"]}}),
-    ];
-    if debug {
-        tools.push(json!({"name": "debug", "description": "Debug a test: stop, locals, stack, step, eval (DAP). args takes the CLI's tokens: [\"--at\", \"src/lib.rs:12\"].",
-            "inputSchema": schema(DEBUG_VERBS.to_vec(), json!({}))}));
-    }
-    tools
+    ]
 }
 
 /// What the 3,600-byte cap counts: the `tools/list` result as sent, plus `instructions`.
-pub fn list_bytes(debug: bool) -> usize {
-    json!({"tools": tools(debug)}).to_string().len() + text("instructions", &[]).len()
+pub fn list_bytes() -> usize {
+    json!({"tools": tools()}).to_string().len() + text("instructions", &[]).len()
 }
 
 /// Serve MCP on a daemon connection after its `hello`, until EOF. A `tools/call` runs on its own
@@ -112,8 +99,6 @@ pub fn list_bytes(debug: bool) -> usize {
 pub fn serve_io(mut reader: impl BufRead, writer: &Mutex<impl Write + Send>, host: &Arc<Host>, caller: Caller) {
     let (calls, mut caller) = (Mutex::new(HashMap::<String, Cancel>::new()), Arc::new(caller));
     let send = |id, reply| crate::daemon::respond(writer, id, reply);
-    // A list that fills late is told to the harness once per session; a session that ends stops waiting for it.
-    let (told, ended) = (AtomicBool::new(false), AtomicBool::new(false));
     thread::scope(|scope| {
         loop {
             let mut msg = match rpc::read(&mut reader, Framing::Lines, rpc::MAX_FRAME) {
@@ -132,18 +117,7 @@ pub fn serve_io(mut reader: impl BufRead, writer: &Mutex<impl Write + Send>, hos
                     Ok(reply)
                 }
                 "ping" => Ok(json!({})),
-                "tools/list" => {
-                    // On a thread of its own: a first listing may wait 10 s for a hosted server.
-                    let (caller, send, told, ended) = (caller.clone(), &send, &told, &ended);
-                    scope.spawn(move || {
-                        let (listing, late) = client::tools_list(host, &caller.env, host.config().mcp.debug);
-                        send(id, Ok(json!({"tools": listing.tools})));
-                        if late.is_some_and(|rx| filled(&rx, ended)) && !told.swap(true, Ordering::SeqCst) {
-                            let _ = rpc::write(&mut *lock(writer), Framing::Lines, &json!({"jsonrpc": "2.0", "method": "notifications/tools/list_changed"}));
-                        }
-                    });
-                    continue;
-                }
+                "tools/list" => Ok(json!({"tools": tools()})),
                 "tools/call" => {
                     let (cancel, key, caller, send, calls) = (Cancel::default(), id.to_string(), caller.clone(), &send, &calls);
                     lock(calls).insert(key.clone(), cancel.clone());
@@ -164,20 +138,8 @@ pub fn serve_io(mut reader: impl BufRead, writer: &Mutex<impl Write + Send>, hos
             };
             send(id, reply);
         }
-        ended.store(true, Ordering::SeqCst);
         lock(&calls).values().for_each(Cancel::cancel);
     });
-}
-
-/// Whether a late list filled, waited for until that is known or the session ends.
-fn filled(rx: &mpsc::Receiver<bool>, ended: &AtomicBool) -> bool {
-    loop {
-        match rx.recv_timeout(Duration::from_millis(100)) {
-            Ok(filled) => return filled,
-            Err(RecvTimeoutError::Timeout) if !ended.load(Ordering::SeqCst) => {}
-            Err(_) => return false,
-        }
-    }
 }
 
 /// Agree on a version, take the client's name for the usage log, and record the session's start.
@@ -189,10 +151,9 @@ fn initialize(host: &Host, caller: &Caller, params: &Value) -> (Value, Caller) {
         next.id.client = clip(params["clientInfo"]["name"].as_str().unwrap_or("unknown"));
         next.id.client_v = params["clientInfo"]["version"].as_str().map(clip);
     }
-    let listing = client::listing(host, &caller.env, host.config().mcp.debug);
-    let (client, client_v, tools, list_bytes) = (next.id.client.clone(), next.id.client_v.clone(), listing.tools.len() as u32, listing.bytes as u64);
+    let (client, client_v, tools, list_bytes) = (next.id.client.clone(), next.id.client_v.clone(), tools().len() as u32, list_bytes() as u64);
     host.usage.record(&caller.env, &caller.id.sess, Event::Init { client, client_v, proto: proto.into(), tools, list_bytes });
-    let reply = json!({"protocolVersion": proto, "capabilities": {"tools": {"listChanged": true}}, "serverInfo": {"name": "itse", "version": VERSION}, "instructions": text("instructions", &[])});
+    let reply = json!({"protocolVersion": proto, "capabilities": {"tools": {}}, "serverInfo": {"name": "itse", "version": VERSION}, "instructions": text("instructions", &[])});
     (reply, next)
 }
 
@@ -212,14 +173,7 @@ fn tool_call(host: &Arc<Host>, caller: &Caller, params: &Value, cancel: &Cancel)
             "show".to_string()
         }
         "test_build_run" | "problems_symbols" => a["verb"].as_str().unwrap_or("").to_string(),
-        "debug" if host.config().mcp.debug => {
-            tokens.push(a["verb"].clone());
-            "debug".to_string()
-        }
-        name => {
-            let exposed = name.contains("__").then(|| client::call(host, caller, name, a.clone(), cancel)).flatten();
-            return exposed.unwrap_or_else(|| json!({"content": [{"type": "text", "text": format!("ERROR {name} — no such tool\n")}], "isError": true}));
-        }
+        name => return json!({"content": [{"type": "text", "text": format!("ERROR {name} — no such tool\n")}], "isError": true}),
     };
     if params["name"] != "show_result" {
         tokens.extend(a.get("target").map(token));

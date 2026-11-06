@@ -13,8 +13,8 @@ fn limits_come_from_extension_data_but_the_oom_score_does_not() {
 fn next_numbers_are_never_reused() {
     let tmp = TempDir::new("itse-host");
     assert_eq!((Next::take(&tmp.0, "run").unwrap(), Next::take(&tmp.0, "q").unwrap(), Next::take(&tmp.0, "run").unwrap()), ("run:1".into(), "q:1".into(), "run:2".into()));
-    let next: Next = serde_json::from_str(r#"{"run": 14}"#).unwrap();
-    assert_eq!(next, Next { run: 14, dbg: 0, q: 0 });
+    let next: Next = serde_json::from_str(r#"{"run": 14, "dbg": 2}"#).unwrap();
+    assert_eq!(next, Next { run: 14, q: 0 }, "an older file's debug counter is dropped, not the file");
 }
 
 use std::io;
@@ -23,7 +23,7 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::mpsc;
 use std::thread;
 
-use crate::rpc::{Dialect, Framing, Handler};
+use crate::rpc::{Framing, Handler};
 use crate::sys::tests::TempDir;
 
 /// Field `n` (1-based, as in proc(5)) of /proc/<pid>/stat.
@@ -71,10 +71,13 @@ fn the_base_env_keeps_the_parents_vars_but_not_itse_claude_or_ai_agent() {
 struct Quiet;
 impl Handler for Quiet {}
 
+/// A server that answers every request (`shutdown`) at once and leaves at `exit`, in lines.
 fn up() -> Server {
+    let script = r#"while read -r l; do case $l in *'"method":"exit"'*) exit 0;; esac; id=${l#*\"id\":}; echo "{\"jsonrpc\":\"2.0\",\"id\":${id%%,*},\"result\":null}"; done"#;
     // The peer reads the child's stdout, so its stream stays open while the child lives.
-    let mut child = spawn(Command::new("sleep").arg("30").stdout(std::process::Stdio::piped()), &Limits::default(), false, 800).unwrap();
-    let peer = Peer::start(io::BufReader::new(child.stdout.take().unwrap()), io::sink(), Framing::Lines, Dialect::Mcp, Arc::new(Quiet));
+    let (piped, piped_in) = (std::process::Stdio::piped(), std::process::Stdio::piped());
+    let mut child = spawn(Command::new("sh").args(["-c", script]).stdin(piped_in).stdout(piped), &Limits::default(), false, 800).unwrap();
+    let peer = Peer::start(io::BufReader::new(child.stdout.take().unwrap()), child.stdin.take().unwrap(), Framing::Lines, Arc::new(Quiet));
     Server { peer, child: Mutex::new(child), exit_codes: BTreeMap::new(), log: PathBuf::new(), idle: Duration::ZERO, hash: String::new(), marker: String::new(), epoch: 0 }
 }
 
@@ -239,7 +242,7 @@ fn a_crashed_server_takes_what_it_started_with_it() {
     // The leader exits and leaves a child in its group, as a server dying under a build would.
     let script = format!("sleep 30 & echo $! > {}; exit 3", left.display());
     let mut child = spawn(Command::new("sh").args(["-c", &script]).stdout(std::process::Stdio::piped()), &Limits::default(), false, 800).unwrap();
-    let peer = Peer::start(io::BufReader::new(child.stdout.take().unwrap()), io::sink(), Framing::Lines, Dialect::Mcp, Arc::new(Quiet));
+    let peer = Peer::start(io::BufReader::new(child.stdout.take().unwrap()), io::sink(), Framing::Lines, Arc::new(Quiet));
     let server =
         Server { peer, child: Mutex::new(child), exit_codes: BTreeMap::new(), log: PathBuf::new(), idle: Duration::ZERO, hash: String::new(), marker: String::new(), epoch: 0 };
     while lock(&server.child).try_wait().unwrap().is_none() {
