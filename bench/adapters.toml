@@ -1,0 +1,40 @@
+# Harness adapters for itse-bench. `{name}` is filled per trial: instruction, mcp_config (from the
+# arm), model, permission_mode, max_turns, ws, cfg, trial, arm, task, task_dir, adapter_dir.
+
+# Claude Code on the subscription: no API key and no dollar cap; trials are capped by turns and
+# wall time. Each trial gets a fresh CLAUDE_CONFIG_DIR at {cfg}/.claude, where
+# `itse integrate claude-code --skill --home {cfg}` puts the skill (~/.claude with ~ at {cfg}).
+# A fresh config has no login, so the token must be in the bench's env (`claude setup-token`
+# makes one; Claude Code does not pass it on to the commands it runs). Only it and a gateway's
+# base URL pass through, and no credentials are copied.
+[claude-code]
+version_cmd = ["claude", "--version"]
+command = [
+    "claude", "-p", "{instruction}", "--output-format", "json", "--strict-mcp-config", "--mcp-config", "{mcp_config}",
+    "--model", "{model}", "--permission-mode", "{permission_mode}", "--max-turns", "{max_turns}",
+]
+parser = "json-last"
+pass_env = ["ANTHROPIC_BASE_URL", "CLAUDE_CODE_OAUTH_TOKEN"]
+require_env = ["CLAUDE_CODE_OAUTH_TOKEN"]
+
+# Every trial alike and quiet, whatever the bench's env holds: no telemetry, no self-update.
+[claude-code.env]
+CLAUDE_CONFIG_DIR = "{cfg}/.claude"
+CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC = "1"
+DISABLE_AUTOUPDATER = "1"
+
+# JSON pointers into the last JSON line; a missing one is null.
+[claude-code.fields]
+cost_usd = "/total_cost_usd"
+turns = "/num_turns"
+is_error = "/is_error"
+fresh_tokens = "/usage/input_tokens"
+cache_read_tokens = "/usage/cache_read_input_tokens"
+cache_write_tokens = "/usage/cache_creation_input_tokens"
+output_tokens = "/usage/output_tokens"
+
+[claude-code.arms.with]
+mcp_config = '{"mcpServers":{"itse":{"type":"stdio","command":"itse","args":["mcp"]}}}'
+
+[claude-code.arms.without]
+mcp_config = '{"mcpServers":{}}'
