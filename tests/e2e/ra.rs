@@ -194,7 +194,40 @@ fn hook_timing(env: &Env) -> Vec<u64> {
     ms
 }
 
-/// On a copy of ITSE_E2E_RA_CRATE=<dir>, else of this crate (without `target/` and `.git`), with
+/// `from`'s tree at `to`, without the folders named `target` or `.git` at any depth: a nested
+/// crate's build output can be larger than the free space of the temp dir.
+fn copy_source(from: &Path, to: &Path) {
+    fs::create_dir_all(to).unwrap();
+    for entry in fs::read_dir(from).unwrap().flatten().filter(|e| e.file_name() != "target" && e.file_name() != ".git") {
+        let (path, dest) = (entry.path(), to.join(entry.file_name()));
+        let kind = entry.file_type().unwrap();
+        if kind.is_symlink() {
+            std::os::unix::fs::symlink(fs::read_link(&path).unwrap(), &dest).unwrap();
+        } else if kind.is_dir() {
+            copy_source(&path, &dest);
+        } else {
+            fs::copy(&path, &dest).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        }
+    }
+}
+
+#[test]
+fn a_crate_is_copied_without_its_build_output_at_any_depth() {
+    let env = Env::new();
+    let src = env.dir.join("src");
+    for dir in ["target/debug", ".git", "src", "bench/target/debug", "bench/src"] {
+        fs::create_dir_all(src.join(dir)).unwrap();
+    }
+    for file in ["Cargo.toml", "src/lib.rs", "target/debug/big", "bench/src/main.rs", "bench/target/debug/big"] {
+        fs::write(src.join(file), "x").unwrap();
+    }
+    copy_source(&src, &env.dir.join("copy"));
+    let copied = |p: &str| env.dir.join("copy").join(p).exists();
+    assert!(copied("Cargo.toml") && copied("src/lib.rs") && copied("bench/src/main.rs"));
+    assert!(!copied("target") && !copied(".git") && !copied("bench/target"));
+}
+
+/// On a copy of ITSE_E2E_RA_CRATE=<dir>, else of this crate (without `target/` and `.git` at any depth), with
 /// cargo's registry index and downloads copied into the private HOME so its dependencies resolve
 /// offline, `problems` until it settles (15 min at most), then find and refs; the daemon's and
 /// rust-analyzer's VmHWM are printed and appended to target/budget/history.jsonl.
@@ -208,10 +241,7 @@ fn rust_analyzer_on_a_larger_crate_records_the_daemon_vmhwm() {
     let src = std::env::var_os("ITSE_E2E_RA_CRATE").map_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")), PathBuf::from);
     let env = Env::new();
     let cp = |from: &Path, to: &Path| Command::new("cp").arg("-r").arg(from).arg(to).status().is_ok_and(|s| s.success());
-    fs::create_dir_all(env.work()).unwrap();
-    for entry in fs::read_dir(&src).unwrap().flatten().filter(|e| e.file_name() != "target" && e.file_name() != ".git") {
-        assert!(cp(&entry.path(), &env.work().join(entry.file_name())), "{}", entry.path().display());
-    }
+    copy_source(&src, &env.work());
     let cargo_home = std::env::var_os("CARGO_HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from(std::env::var_os("HOME").unwrap()).join(".cargo"));
     fs::create_dir_all(env.dir.join("home/.cargo/registry")).unwrap();
     for part in ["index", "cache"] {

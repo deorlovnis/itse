@@ -183,10 +183,12 @@ impl Run<'_> {
         if with {
             task.bench.uses.iter().try_for_each(|ext| self.itse(env, dir, &["use", ext]).map(drop))?;
             self.itse(env, dir, &["trust"])?;
-            // The harness's skill under `home` (its `~`): true once installed, null while itse has no integrate.
-            let integrated = self.itse(env, dir, &["integrate", &self.o.harness, "--skill", "--home", &home, "--yes"]);
-            let missing = integrated.as_ref().is_err_and(|e| ["not built yet", "unknown verb"].iter().any(|m| e.to_string().contains(m)));
-            skill = if missing { Value::Null } else { integrated.map(|_| json!(true))? };
+            // The harness's skill under `home` (its `~`): true once installed; null with no extension to integrate, or no integrate.
+            if let Some(ext) = &self.adapter.integrate {
+                let integrated = self.itse(env, dir, &["integrate", ext, "--skill", "--home", &home, "--yes"]);
+                let missing = integrated.as_ref().is_err_and(|e| ["not built yet", "unknown verb"].iter().any(|m| e.to_string().contains(m)));
+                skill = if missing { Value::Null } else { integrated.map(|_| json!(true))? };
+            }
         }
         let usage_log = dir.join("state/itse/usage.jsonl");
         let usage_from = fs::metadata(&usage_log).map_or(0, |m| m.len());

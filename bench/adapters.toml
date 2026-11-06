@@ -16,6 +16,7 @@ command = [
 parser = "json-last"
 pass_env = ["ANTHROPIC_BASE_URL", "CLAUDE_CODE_OAUTH_TOKEN"]
 require_env = ["CLAUDE_CODE_OAUTH_TOKEN"]
+integrate = "claude-code"
 
 # Every trial alike and quiet, whatever the bench's env holds: no telemetry, no self-update.
 [claude-code.env]

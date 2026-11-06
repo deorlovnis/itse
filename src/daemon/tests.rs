@@ -114,7 +114,7 @@ fn mcp_args_go_through_the_cli_parser() {
     let mut c = Client::new(&host(&tmp));
     c.hello();
     let reply = c.ask("call", json!({"verb": "status", "args": ["--frobnicate"]}));
-    assert_eq!(reply["result"], json!({"exit": 2, "text": "ERROR status — invalid option '--frobnicate'\n"}));
+    assert_eq!(reply["result"], json!({"exit": 2, "text": "ERROR status — invalid option '--frobnicate'\n", "verdict": "error", "settled": null}));
 }
 
 #[test]
@@ -123,7 +123,7 @@ fn args_that_are_not_strings_are_refused() {
     let mut c = Client::new(&host(&tmp));
     c.hello();
     let reply = c.ask("call", json!({"verb": "status", "args": [14]}));
-    assert_eq!(reply["result"], json!({"exit": 2, "text": "ERROR status — args must be strings\n"}));
+    assert_eq!(reply["result"], json!({"exit": 2, "text": "ERROR status — args must be strings\n", "verdict": "error", "settled": null}));
 }
 
 #[test]
@@ -135,7 +135,7 @@ fn a_cancel_request_ends_a_slow_call() {
     c.send(&json!({"jsonrpc": "2.0", "id": 7, "method": "call", "params": {"verb": "status"}}).to_string());
     thread::sleep(Duration::from_millis(100));
     c.send(&json!({"jsonrpc": "2.0", "method": "$/cancelRequest", "params": {"id": 7}}).to_string());
-    assert_eq!(c.recv(), json!({"jsonrpc": "2.0", "id": 7, "result": {"exit": 130, "text": "ERROR status — cancelled\n"}}));
+    assert_eq!(c.recv(), json!({"jsonrpc": "2.0", "id": 7, "result": {"exit": 130, "text": "ERROR status — cancelled\n", "verdict": "error", "settled": null}}));
     assert!(started.elapsed() < Duration::from_secs(5));
 }
 

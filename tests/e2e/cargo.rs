@@ -148,6 +148,8 @@ fn a_run_that_outlasts_the_wait_is_parsed_when_it_ends() {
     let env = Env::new();
     let Some(work) = rust_ws(&env, true) else { return };
     break_lib(&work);
+    // A build script that sleeps, so the build outlasts `wait: 0` however fast the machine is.
+    fs::write(work.join("build.rs"), "fn main() { std::thread::sleep(std::time::Duration::from_secs(2)); }").unwrap();
     let mut mcp = env.mcp(&[]);
     mcp.handshake("e2e");
     let (is_error, text) = mcp.call("test_build_run", json!({"verb": "build", "wait": 0}));

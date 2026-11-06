@@ -331,7 +331,7 @@ pub fn problems(store: &Store, scope: &str, all: bool, new: bool, key: &str, pus
     } else {
         Verdict::Ok
     };
-    Ok(Outcome { items, notes, ..Outcome::new("problems", verdict, scope, counts) })
+    Ok(Outcome { items, notes, settled: Some(settled), ..Outcome::new("problems", verdict, scope, counts) })
 }
 
 /// The baseline of `key`, replaced by `next(baseline)` when given, under a lock so parallel calls

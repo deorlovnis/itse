@@ -1,6 +1,7 @@
 //! The session host: the daemon's shared state (`Host`), its registry of
 //! server slots and live runs, `procs.json`, how children are spawned (own process group, rlimits,
-//! OOM score), what a crash leaves, and the clean-up after a daemon restart.
+//! OOM score), the start of a protocol server that the LSP and MCP clients share, what a crash
+//! leaves, and the clean-up after a daemon restart.
 //!
 //! A slot has two parts, so `status` never hangs on a start: `phase`, behind a Mutex and a Condvar,
 //! which one caller moves to `Starting` and then starts the server with no lock held while the
@@ -20,7 +21,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::actions::{self, Run};
-use crate::{lsp, manifest::Config, manifest::DapVia, rpc::Cancel, rpc::Peer, sys, sys::lock, usage::Usage, workspace::Dirs, workspace::Workspace};
+use crate::resolve::Resolved;
+use crate::rpc::{Cancel, Dialect, Framing, Handler, Peer};
+use crate::{lsp, manifest::Config, manifest::DapVia, results::State, sys, sys::lock, usage::Usage, workspace::Dirs, workspace::Workspace};
 
 /// The env var each server is started with, set to a value of its own, which its children inherit:
 /// rust-analyzer starts `cargo check` in a session of its own, out of reach of the server's group.
@@ -114,6 +117,91 @@ impl Host {
         Ok((child, file))
     }
 
+    /// `<kind>:<id>` up for a call, started on demand by the first caller while the others wait for
+    /// it, unless `start` is false: then None if it isn't up. One found ended leaves `procs.json`
+    /// here. `begin` starts it, as `start_server` with the kind's handshake.
+    pub fn ask(&self, kind: &str, l: &Launch, start: bool, cancel: &Cancel, begin: impl FnOnce(&Slot) -> Result<Server>) -> Result<Option<Asked>> {
+        let handle = format!("{kind}:{}", l.id);
+        let slot = self.slot(&handle);
+        let (up, ended) = slot.get();
+        ended.inspect(|&pid| self.untrack(&handle, pid));
+        let (server, note, fresh) = match up {
+            Some(server) => (server, None, false),
+            None if !start => return Ok(None),
+            None => slot.up(|| begin(&slot), cancel)?,
+        };
+        let notes = note.map(|n| format!("{} {n}", l.id)).into_iter().chain(changed(kind, &server, l)).collect();
+        Ok(Some(Asked { handle, slot, server, notes, fresh }))
+    }
+
+    /// Spawn a server of `kind` in its own group, stderr to `servers/<id>.log` (the last start's
+    /// kept as `<id>.log.1`, so a crash's tail is this start's; the daemon starts it afresh past
+    /// 4 MB), make its peer with the reader `handler` gives for this start's epoch and the log, and
+    /// run `init`, the kind's handshake. It is in `procs.json` from the spawn on, with the
+    /// `ITSE_SERVER` marker its env passes down to what it starts, so a daemon that dies during a
+    /// long handshake leaves nothing behind; the marker is the one `ITSE_*` var a server gets. A
+    /// server that ends or fails before the handshake is done has its group and its marked
+    /// processes killed, and says how, with its log's last line.
+    #[allow(clippy::too_many_arguments)]
+    pub fn start_server(
+        &self,
+        slot: &Slot,
+        kind: &str,
+        l: &Launch,
+        env: &BTreeMap<String, String>,
+        framing: Framing,
+        dialect: Dialect,
+        handler: impl FnOnce(u64, File) -> Arc<dyn Handler>,
+        init: impl FnOnce(&Server) -> Result<()>,
+    ) -> Result<Server> {
+        // Before the log turns over, so a server that can't start leaves the last real logs as they were.
+        ensure!(!l.argv.is_empty(), "{} has no command", l.id);
+        let (dir, handle) = (self.ws.state_dir(&self.dirs).join("servers"), format!("{kind}:{}", l.id));
+        sys::private_dir(&dir)?;
+        let log = dir.join(format!("{}.log", l.id));
+        let _ = fs::rename(&log, dir.join(format!("{}.log.1", l.id)));
+        let marker = format!("{}-{}", std::process::id(), sys::hex(&sys::random_bytes::<8>()?));
+        let (mut child, file) = self.spawn_as(&handle, kind, l, &l.argv, env, &log, &marker, true)?;
+        // Only the one start under way changes the epoch.
+        let epoch = lock(&slot.live).epoch + 1;
+        *lock(&slot.live) = Live { epoch, ..Live::default() };
+        let (Some(stdout), Some(stdin)) = (child.stdout.take(), child.stdin.take()) else { bail!("{} has no stdio", l.id) };
+        let peer = Peer::start(io::BufReader::new(stdout), stdin, framing, dialect, handler(epoch, file));
+        let secs = env::var("ITSE_SERVER_IDLE_S").ok().and_then(|s| s.parse().ok());
+        let idle = Duration::from_secs(secs.unwrap_or_else(|| l.idle_minutes.or(self.config().server_idle_minutes).unwrap_or(30) * 60));
+        let server = Server { peer, child: Mutex::new(child), exit_codes: l.exit_codes.clone(), log, idle, hash: launch_hash(l), marker, epoch };
+        if let Err(e) = init(&server) {
+            let ended = self.kill_child(&handle, &mut lock(&server.child), &server.marker).map(|s| Crash::new(s, &l.exit_codes, &server.log));
+            let tail = ended.as_ref().ok().and_then(|c| c.stderr_tail.last().map(|t| format!("; log: {t}"))).unwrap_or_default();
+            bail!("{} {e}{tail}", ended.map_or("killed".into(), |c| c.text));
+        }
+        Ok(server)
+    }
+
+    /// The `status` row of `<kind>:<id>`, read without waiting on a start: `starting (41 s)`, `up`
+    /// with what `summary` makes of its live state, `crashed` with how, `gone` after a daemon
+    /// restart, or `stopped`.
+    pub fn row(&self, kind: &str, l: &Launch, summary: impl FnOnce(&Live) -> Vec<String>) -> State {
+        let handle = format!("{kind}:{}", l.id);
+        let slot = lock(&self.slots).get(&handle).cloned().unwrap_or_default();
+        let (state, reason) = match slot.phase.try_lock().as_deref() {
+            Ok(Phase::Starting(at)) => (format!("starting ({} s)", at.elapsed().as_secs()), String::new()),
+            Ok(Phase::Up(s)) => {
+                let live = lock(&slot.live);
+                let pid = s.child.try_lock().map(|c| format!("pid {}", c.id()));
+                let parts: Vec<String> = pid.into_iter().chain(summary(&live)).chain(changed(kind, s, l)).chain(live.last.back().cloned()).collect();
+                ("up".into(), parts.join("; "))
+            }
+            Ok(Phase::Crashed(c)) => {
+                ("crashed".into(), format!("{}{}; the next use starts it again", c.text, c.stderr_tail.last().map_or(String::new(), |t| format!("; log: {t}"))))
+            }
+            Ok(Phase::Gone(why)) => ("gone".into(), format!("{why}; the next use starts it cold")),
+            Ok(Phase::Stopped) => ("stopped".into(), "starts on first use".into()),
+            Err(_) => ("busy".into(), String::new()),
+        };
+        State { item: handle, state, reason: Some(reason).filter(|r| !r.is_empty()), ..State::default() }
+    }
+
     /// Kill `child`'s group and what carries `marker`, drop it from `procs.json`, and reap it.
     pub fn kill_child(&self, handle: &str, child: &mut Child, marker: &str) -> io::Result<ExitStatus> {
         let pid = child.id() as i32;
@@ -151,6 +239,12 @@ impl Host {
         }
         self.track("", None);
         runs.into_iter().for_each(|p| actions::adopt(self, p));
+    }
+
+    /// The env a server starts with: the base env, with the workspace's composed on top.
+    pub fn server_env(&self, r: &Resolved) -> Result<BTreeMap<String, String>> {
+        let base: BTreeMap<String, String> = self.base_env.iter().map(|(k, v)| (k.to_string_lossy().into_owned(), v.to_string_lossy().into_owned())).collect();
+        crate::env::workspace_env(r, &self.dirs, base.clone(), &crate::store::Real(base))
     }
 
     /// `config.json`, read again on each use, so an edit applies to the next call.
@@ -251,6 +345,29 @@ impl Host {
     }
 }
 
+/// A server up for a call, from `Host::ask`.
+pub struct Asked {
+    pub handle: String,
+    pub slot: Arc<Slot>,
+    pub server: Arc<Server>,
+    /// Why it was started now (after a crash, or cold after a daemon restart), and a config changed since.
+    pub notes: Vec<String>,
+    /// This call started it, or waited for its start.
+    pub fresh: bool,
+}
+
+/// The launch's hash, as `Server::hash`. What only chooses the tools listed (`expose`, `tools`,
+/// `max_list_bytes`) needs no restart, so it is left out.
+pub fn launch_hash(l: &Launch) -> String {
+    let l = Launch { expose: false, tools: None, max_list_bytes: None, ..l.clone() };
+    sys::sha256_hex(format!("{l:?}").as_bytes())[..12].to_string()
+}
+
+/// A server left running from a launch that has changed since.
+fn changed(kind: &str, s: &Server, l: &Launch) -> Option<String> {
+    (s.hash != launch_hash(l)).then(|| format!("config changed; 'itse stop {kind}:{}' to apply", l.id))
+}
+
 /// The daemon's env minus `ITSE_*`, `CLAUDE_*` and `AI_AGENT`, which name its starter, not a server's.
 pub fn base_env(vars: impl Iterator<Item = (OsString, OsString)>) -> Vec<(OsString, OsString)> {
     vars.filter(|(k, _)| !(k.as_encoded_bytes().starts_with(b"ITSE_") || k.as_encoded_bytes().starts_with(b"CLAUDE_") || k == "AI_AGENT")).collect()
@@ -304,11 +421,13 @@ pub struct Launch {
     /// What it writes into the workspace itself, as declared.
     pub outputs: Vec<String>,
     pub idle_minutes: Option<u64>,
-    // The hosted MCP client reads these.
-    #[allow(dead_code)]
+    /// How long an MCP server's tool call may take; 120 s when unset.
     pub timeout_s: Option<u64>,
-    #[allow(dead_code)]
+    /// An MCP server whose tools the developer layer lists in itse's own, with its allowlist and
+    /// its share of the list's bytes.
     pub expose: bool,
+    pub tools: Option<Vec<String>>,
+    pub max_list_bytes: Option<usize>,
     pub via: Option<DapVia>,
 }
 
@@ -403,13 +522,15 @@ pub struct Live {
     pub lsp: lsp::Seen,
     /// When a call last used the server, for the idle stop.
     pub used: Instant,
+    /// An MCP server said its tool list changed: the next listing asks it again.
+    pub tools_changed: bool,
     /// Counts the starts, so the reader of an earlier one records nothing here.
     pub epoch: u64,
 }
 
 impl Default for Live {
     fn default() -> Self {
-        Self { last: VecDeque::new(), lsp: lsp::Seen::default(), used: Instant::now(), epoch: 0 }
+        Self { last: VecDeque::new(), lsp: lsp::Seen::default(), used: Instant::now(), tools_changed: false, epoch: 0 }
     }
 }
 
@@ -513,7 +634,8 @@ impl Slot {
 }
 
 impl Server {
-    /// The protocol's goodbye (LSP `shutdown`, waiting up to `wait`, and `exit`), up to 2 s for the
+    /// The protocol's goodbye (LSP `shutdown`, waiting up to `wait`, and `exit`; an MCP server's
+    /// stdin closed), up to 2 s for the
     /// process to go, and its group and marked processes are killed; its pid. Writes never block, so
     /// neither does this.
     pub fn stop(&self, wait: Duration) -> i32 {
